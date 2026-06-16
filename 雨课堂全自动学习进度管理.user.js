@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.2.4
+// @version      0.2.5
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节。
 // @author       local
 // @license      GPL-3.0-only
@@ -25,6 +25,8 @@
    */
 
   var SCRIPT_NAME = "雨课堂自动学习";
+  var ROUTE_STABLE_WAIT_MS = 5000;
+  var POST_VIDEO_RESCAN_WAIT_MS = 5000;
   var CONFIG_KEYS = {
     playbackRate: "yt_auto.playbackRate",
     targetCourseName: "yt_auto.targetCourseName",
@@ -244,8 +246,11 @@
     if (queue.phase === "learning" || routeName() === "myTraining") {
       var url = queue.myTrainingUrl || buildMyTrainingUrl();
       if (url) {
-        setStatus(STATUS.scanning, reason || "当前课程完成，返回培训进度页");
-        return navigateTo(url, "返回培训进度页");
+        setStatus(STATUS.scanning, (reason || "当前课程完成") + "，等待平台同步后返回培训进度页");
+        schedule(function () {
+          if (!isPaused()) navigateTo(url, "返回培训进度页");
+        }, ROUTE_STABLE_WAIT_MS);
+        return true;
       }
     }
     return advanceQueue(reason || "当前课程完成");
@@ -695,13 +700,7 @@
       return;
     }
     if (name === "studyContent") {
-      setStatus(STATUS.scanning, "正在扫描章节");
-      var chapters = scanChapters();
-      state.chapterItems = chapters;
-      renderPanel();
-      var next = findNextPlayableChapter(chapters);
-      if (next) enterChapter(next, "进入未完成视频 " + next.title);
-      else completeCurrentCourse("当前课程没有未完成视频章节");
+      handleStudyContentPage(readConfig());
       return;
     }
     if (name === "video") {
@@ -1078,12 +1077,17 @@
       phase: "learning",
       myTrainingUrl: location.href
     });
-    setStatus(STATUS.scanning, "扫描已选课程进度");
-    return retryWait(function () {
-      var rows = scanMyTrainingRows();
-      return rows.length ? rows : null;
-    }, "已选课程表格", config.maxRetries).then(function (rows) {
+    setStatus(STATUS.scanning, "等待培训进度页刷新");
+    return delay(ROUTE_STABLE_WAIT_MS).then(function () {
+      if (isPaused()) return null;
+      setStatus(STATUS.scanning, "扫描已选课程进度");
+      return retryWait(function () {
+        var rows = scanMyTrainingRows();
+        return rows.length ? rows : null;
+      }, "已选课程表格", config.maxRetries);
+    }).then(function (rows) {
       if (isPaused()) return;
+      if (!rows) return;
       state.courseItems = rows;
       renderPanel();
       var next = rows.find(function (row) {
@@ -1195,12 +1199,17 @@
   }
 
   function handleStudyContentPage(config) {
-    setStatus(STATUS.scanning, "等待章节列表");
-    return retryWait(function () {
-      var chapters = scanChapters();
-      return chapters.length ? chapters : null;
-    }, "章节列表", config.maxRetries).then(function (chapters) {
+    setStatus(STATUS.scanning, "等待学习内容页刷新");
+    return delay(ROUTE_STABLE_WAIT_MS).then(function () {
+      if (isPaused()) return null;
+      setStatus(STATUS.scanning, "等待章节列表");
+      return retryWait(function () {
+        var chapters = scanChapters();
+        return chapters.length ? chapters : null;
+      }, "章节列表", config.maxRetries);
+    }).then(function (chapters) {
       if (isPaused()) return;
+      if (!chapters) return;
       state.chapterItems = chapters;
       renderPanel();
       var next = findNextPlayableChapter(chapters);
@@ -1278,6 +1287,7 @@
         var type = Number(leaf.leaf_type);
         if (type !== 0) return;
         var progress = Number(schedules[leaf.id] || 0);
+        var complete = progress >= 1;
         var title = leaf.name || chapter.name || ("视频 " + leaf.id);
         var url = location.origin + "/pro/lms/" + encodeURIComponent(sign) + "/" + encodeURIComponent(classroomId) + "/video/" + encodeURIComponent(leaf.id);
         items.push({
@@ -1288,9 +1298,9 @@
           element: findChapterElementByTitle(title) || container,
           type: "video",
           typeLabel: "视频",
-          complete: progress >= 0.99,
+          complete: complete,
           progress: progress,
-          statusLabel: progress >= 0.99 ? "已完成" : Math.round(progress * 100) + "%",
+          statusLabel: complete ? "已完成" : Math.floor(progress * 100) + "%",
           locked: false
         });
       });
@@ -1307,9 +1317,10 @@
 
   function closestChapterContainer(element) {
     var selectors = [
-      ".chapter-list",
       ".leaf-detail",
       ".content",
+      ".leaf-title",
+      ".chapter-list",
       "li",
       "[role='treeitem']",
       "[role='listitem']",
@@ -1420,7 +1431,7 @@
       applyYuketangMediaDefaults(video, config.playbackRate);
       if (isVideoNearlyEnded(video)) {
         state.handledEnd = true;
-        log("检测到播放进度达到 99%");
+        log("检测到视频已到结尾");
         goNextAfterVideo();
       }
     };
@@ -1578,8 +1589,8 @@
   function isVideoNearlyEnded(video) {
     if (!video || !Number.isFinite(video.duration) || video.duration <= 0) return false;
     if (video.ended) return true;
-    var progress = video.currentTime / video.duration;
-    return progress >= 0.99 || video.duration - video.currentTime <= 1.5;
+    var remaining = video.duration - video.currentTime;
+    return remaining >= 0 && remaining <= 0.5;
   }
 
   function goNextAfterVideo() {
@@ -1592,18 +1603,20 @@
         clickElement(next, "跳转下一节");
         return;
       }
-      var queue = readQueue();
-      if (queue.phase === "learning" && queue.myTrainingUrl) {
-        log("未找到下一节按钮，返回培训进度页重新调度");
-        delay(2500).then(function () {
-          completeCurrentCourse("当前视频完成");
+      var studyUrl = buildStudyContentUrl();
+      if (studyUrl) {
+        log("未找到下一节按钮，等待平台同步后返回学习内容页重新扫描");
+        delay(POST_VIDEO_RESCAN_WAIT_MS).then(function () {
+          if (!isPaused()) navigateTo(studyUrl, "返回学习内容页重新扫描");
         });
         return;
       }
-      var studyUrl = buildStudyContentUrl();
-      if (studyUrl) {
-        log("未找到下一节按钮，返回学习内容页重新扫描");
-        navigateTo(studyUrl, "返回学习内容页重新扫描");
+      var queue = readQueue();
+      if (queue.phase === "learning" && queue.myTrainingUrl) {
+        log("未找到学习内容页地址，等待平台同步后返回培训进度页重新调度");
+        delay(POST_VIDEO_RESCAN_WAIT_MS).then(function () {
+          if (!isPaused()) completeCurrentCourse("当前视频完成");
+        });
         return;
       }
       pause("无法确定下一节或学习内容页地址");
