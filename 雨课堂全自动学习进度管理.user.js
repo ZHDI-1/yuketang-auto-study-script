@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.2.10
+// @version      0.2.11
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节。
 // @author       local
 // @license      GPL-3.0-only
@@ -30,6 +30,13 @@
   var POST_VIDEO_RESCAN_WAIT_MS = 5000;
   var VIDEO_END_SYNC_WAIT_MS = 7000;
   var POST_HEARTBACK_SETTLE_MS = 1500;
+  var PANEL_RENDER_THROTTLE_MS = 200;
+  var WAIT_MUTATION_THROTTLE_MS = 250;
+  var PLAY_RESTORE_DELAY_MS = 1500;
+  var PLAY_RESTORE_COOLDOWN_MS = 10000;
+  var PLAY_FAILURE_RETRY_MS = 3000;
+  var MAX_PLAY_RESTORE_RETRIES = 3;
+  var SPEED_SYNC_COOLDOWN_MS = 5000;
   var CONFIG_KEYS = {
     playbackRate: "yt_auto.playbackRate",
     targetCourseName: "yt_auto.targetCourseName",
@@ -87,7 +94,8 @@
     completedRouteKey: "",
     navigatingTo: "",
     navigationStartedAt: 0,
-    lastUserGestureAt: 0
+    lastUserGestureAt: 0,
+    panelRenderTimer: 0
   };
 
   function getPageWindow() {
@@ -150,7 +158,7 @@
     if (patch.phase !== undefined) GM_setValue(CONFIG_KEYS.flowPhase, String(patch.phase || ""));
     if (patch.myTrainingUrl !== undefined) GM_setValue(CONFIG_KEYS.myTrainingUrl, String(patch.myTrainingUrl || ""));
     state.queueItems = items || [];
-    renderPanel();
+    requestRenderPanel();
   }
 
   function resetQueue(reason) {
@@ -283,12 +291,17 @@
     } else {
       console.log("[" + SCRIPT_NAME + "] " + message);
     }
-    renderPanel();
+    requestRenderPanel();
   }
 
   function setStatus(status, message) {
+    message = message || "";
+    if (state.status === status && state.message === message) {
+      requestRenderPanel();
+      return;
+    }
     state.status = status;
-    state.message = message || "";
+    state.message = message;
     log(status + (message ? "：" + message : ""));
   }
 
@@ -355,6 +368,8 @@
     var opts = Object.assign({
       timeout: 15000,
       interval: 400,
+      mutationThrottle: WAIT_MUTATION_THROTTLE_MS,
+      observeAttributes: false,
       root: document.body || document.documentElement,
       label: "元素"
     }, options || {});
@@ -363,12 +378,22 @@
       var startedAt = Date.now();
       var settled = false;
       var interval = 0;
+      var mutationTimer = 0;
       var observer = null;
 
       function cleanup() {
         if (interval) window.clearInterval(interval);
+        if (mutationTimer) window.clearTimeout(mutationTimer);
         if (observer) observer.disconnect();
         state.observerDisposers = state.observerDisposers.filter(function (dispose) { return dispose !== cleanup; });
+      }
+
+      function requestCheck() {
+        if (settled || mutationTimer) return;
+        mutationTimer = window.setTimeout(function () {
+          mutationTimer = 0;
+          check();
+        }, opts.mutationThrottle);
       }
 
       function check() {
@@ -402,8 +427,12 @@
       }
 
       interval = window.setInterval(check, opts.interval);
-      observer = new MutationObserver(check);
-      observer.observe(opts.root || document.documentElement, { childList: true, subtree: true, attributes: true });
+      observer = new MutationObserver(requestCheck);
+      observer.observe(opts.root || document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: Boolean(opts.observeAttributes)
+      });
       state.observerDisposers.push(cleanup);
       check();
     });
@@ -590,6 +619,14 @@
     });
 
     renderPanel();
+  }
+
+  function requestRenderPanel() {
+    if (state.panelRenderTimer) return;
+    state.panelRenderTimer = window.setTimeout(function () {
+      state.panelRenderTimer = 0;
+      renderPanel();
+    }, PANEL_RENDER_THROTTLE_MS);
   }
 
   function savePanelConfig() {
@@ -840,7 +877,7 @@
         all.push(stripCourseQueueItem(item));
       });
       state.courseItems = all;
-      renderPanel();
+      requestRenderPanel();
       log("已扫描课程 " + all.length + " 门");
 
       var next = findSelectCourseNextPageButton();
@@ -859,7 +896,7 @@
       myTrainingUrl: buildMyTrainingUrl()
     });
     state.courseItems = all;
-    renderPanel();
+    requestRenderPanel();
     return all;
   }
 
@@ -1101,7 +1138,7 @@
       if (isPaused()) return;
       if (!rows) return;
       state.courseItems = rows;
-      renderPanel();
+      requestRenderPanel();
       var next = rows.find(function (row) {
         return !row.complete && row.action;
       });
@@ -1223,7 +1260,7 @@
       if (isPaused()) return;
       if (!chapters) return;
       state.chapterItems = chapters;
-      renderPanel();
+      requestRenderPanel();
       var next = findNextPlayableChapter(chapters);
       if (next) {
         enterChapter(next, "自动进入未完成视频 " + next.title);
@@ -1464,7 +1501,7 @@
       schedule(function () {
         try {
           video.load();
-          playYuketangVideo(video);
+          playYuketangVideo(video, "error-retry", { force: true });
         } catch (error) {
           console.warn(error);
         }
@@ -1483,10 +1520,6 @@
       if (stopObserveRate) stopObserveRate();
       if (stopObservePause) stopObservePause();
     });
-
-    if (!stopObservePause) {
-      playYuketangVideo(video);
-    }
   }
 
   function applyYuketangMediaDefaults(video) {
@@ -1593,9 +1626,12 @@
     var speedKey = Number(rate).toFixed(2);
     var speedWrap = document.getElementsByTagName("xt-speedbutton")[0];
     var speedValue = speedWrap && speedWrap.querySelector("xt-speedvalue");
-    if (speedValue) speedValue.textContent = speedKey + "X";
+    if (speedValue && speedValue.textContent !== speedKey + "X") speedValue.textContent = speedKey + "X";
     Array.from(document.querySelectorAll("xt-speedlist [data-speed]")).forEach(function (node) {
-      node.classList.toggle("xt_video_player_common_active", Math.abs(Number(node.getAttribute("data-speed")) - Number(rate)) <= 0.001);
+      var active = Math.abs(Number(node.getAttribute("data-speed")) - Number(rate)) <= 0.001;
+      if (node.classList.contains("xt_video_player_common_active") !== active) {
+        node.classList.toggle("xt_video_player_common_active", active);
+      }
     });
   }
 
@@ -1637,66 +1673,132 @@
 
   function muteYuketangPlayer(video) {
     try {
-      var muteButton = document.querySelector("#video-box > div > xt-wrap > xt-controls > xt-inner > xt-volumebutton > xt-icon");
-      if (muteButton) {
-        muteButton.click();
-      }
       applyYuketangMediaDefaults(video || document.querySelector("video"));
     } catch (error) {
       log("设置静音失败：" + error.message);
     }
   }
 
-  function playYuketangVideo(video) {
-    if (!video || isPaused()) return;
+  function videoRuntime(video) {
+    if (!video) return null;
+    if (!video.__ytAutoRuntime) {
+      video.__ytAutoRuntime = {
+        playInFlight: false,
+        resumeTimer: 0,
+        lastPlayAttemptAt: 0,
+        lastSpeedSyncAt: 0,
+        lastPlayFailureAt: 0,
+        restoreRetries: 0
+      };
+    }
+    return video.__ytAutoRuntime;
+  }
+
+  function clearVideoResumeTimer(video) {
+    var runtime = videoRuntime(video);
+    if (!runtime || !runtime.resumeTimer) return;
+    window.clearTimeout(runtime.resumeTimer);
+    state.timers = state.timers.filter(function (item) { return item !== runtime.resumeTimer; });
+    runtime.resumeTimer = 0;
+  }
+
+  function scheduleVideoResume(video, reason, delayMs) {
+    var runtime = videoRuntime(video);
+    if (!runtime || runtime.resumeTimer || state.handledEnd || isPaused() || video.ended) return;
+    runtime.resumeTimer = schedule(function () {
+      runtime.resumeTimer = 0;
+      if (state.handledEnd || isPaused() || video.ended || !video.paused) return;
+      if (video.readyState < 2) return;
+      playYuketangVideo(video, reason || "resume");
+    }, delayMs);
+  }
+
+  function playYuketangVideo(video, reason, options) {
+    options = options || {};
+    if (!video || isPaused() || state.handledEnd || video.ended) return;
+    var runtime = videoRuntime(video);
+    if (!runtime || runtime.playInFlight) return;
+    if (!options.force && !video.paused) return;
+    if (!options.force && video.readyState < 2) return;
+    var now = Date.now();
+    if (!options.force && now - runtime.lastPlayAttemptAt < PLAY_RESTORE_COOLDOWN_MS) return;
+
+    runtime.playInFlight = true;
+    runtime.lastPlayAttemptAt = now;
     applyYuketangMediaDefaults(video);
-    applyYuketangSpeed(readConfig().playbackRate);
+    if (options.force || now - runtime.lastSpeedSyncAt >= SPEED_SYNC_COOLDOWN_MS) {
+      applyYuketangSpeed(readConfig().playbackRate);
+      runtime.lastSpeedSyncAt = now;
+    }
+
+    function onPlaySuccess() {
+      runtime.playInFlight = false;
+      runtime.restoreRetries = 0;
+      schedule(function () {
+        if (!isPaused() && !state.handledEnd && !video.ended) {
+          applyYuketangSpeed(readConfig().playbackRate);
+          runtime.lastSpeedSyncAt = Date.now();
+        }
+      }, 800);
+    }
+
+    function onPlayFailure(error) {
+      runtime.playInFlight = false;
+      runtime.restoreRetries += 1;
+      var failedAt = Date.now();
+      if (failedAt - runtime.lastPlayFailureAt > 15000) {
+        runtime.lastPlayFailureAt = failedAt;
+        console.warn("自动播放失败:", error);
+      }
+      if (runtime.restoreRetries <= MAX_PLAY_RESTORE_RETRIES && !state.handledEnd && !isPaused() && !video.ended && video.paused) {
+        scheduleVideoResume(video, reason || "play-failed", PLAY_FAILURE_RETRY_MS);
+      }
+    }
+
     try {
       var promise = video.play();
       if (promise && typeof promise.then === "function") {
-        promise.then(function () {
-          schedule(function () {
-            if (!isPaused() && !state.handledEnd && !video.ended) {
-              applyYuketangSpeed(readConfig().playbackRate);
-            }
-          }, 500);
-        });
-      }
-      if (promise && typeof promise.catch === "function") {
-        promise.catch(function (error) {
-          console.warn("自动播放失败:", error);
-          schedule(function () {
-            if (!isPaused() && !state.handledEnd && !video.ended && video.paused) {
-              playYuketangVideo(video);
-            }
-          }, 3000);
-        });
+        promise.then(onPlaySuccess).catch(onPlayFailure);
+      } else {
+        onPlaySuccess();
       }
     } catch (error) {
-      console.warn("自动播放失败:", error);
-      schedule(function () {
-        if (!isPaused() && !state.handledEnd && !video.ended && video.paused) {
-          playYuketangVideo(video);
-        }
-      }, 3000);
+      onPlayFailure(error);
     }
   }
 
   function observeYuketangPause(video) {
     if (!video) return function () {};
-    playYuketangVideo(video);
-    var target = document.getElementsByClassName("play-btn-tip")[0];
-    if (!target) return null;
-    var observer = new MutationObserver(function (list) {
-      for (var i = 0; i < list.length; i += 1) {
-        if (list[i].type === "childList" && textOf(target) === "播放" && !state.handledEnd && !isPaused() && !video.ended) {
-          playYuketangVideo(video);
-        }
-      }
-    });
-    observer.observe(target, { childList: true });
+    playYuketangVideo(video, "initial", { force: true });
+
+    var onPause = function () {
+      if (state.handledEnd || isPaused() || video.ended || !video.paused) return;
+      scheduleVideoResume(video, "pause", PLAY_RESTORE_DELAY_MS);
+    };
+    var onWaiting = function () {
+      clearVideoResumeTimer(video);
+    };
+    var onCanPlay = function () {
+      if (video.paused) scheduleVideoResume(video, "canplay", PLAY_RESTORE_DELAY_MS);
+    };
+    var onPlaying = function () {
+      var runtime = videoRuntime(video);
+      if (runtime) runtime.restoreRetries = 0;
+      clearVideoResumeTimer(video);
+    };
+
+    video.addEventListener("pause", onPause);
+    video.addEventListener("waiting", onWaiting);
+    video.addEventListener("stalled", onWaiting);
+    video.addEventListener("canplay", onCanPlay);
+    video.addEventListener("playing", onPlaying);
     return function () {
-      observer.disconnect();
+      clearVideoResumeTimer(video);
+      video.removeEventListener("pause", onPause);
+      video.removeEventListener("waiting", onWaiting);
+      video.removeEventListener("stalled", onWaiting);
+      video.removeEventListener("canplay", onCanPlay);
+      video.removeEventListener("playing", onPlaying);
     };
   }
 
