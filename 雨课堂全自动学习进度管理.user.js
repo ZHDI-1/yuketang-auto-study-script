@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.2.11
+// @version      0.3.0
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节。
 // @author       local
 // @license      GPL-3.0-only
@@ -37,6 +37,10 @@
   var PLAY_FAILURE_RETRY_MS = 3000;
   var MAX_PLAY_RESTORE_RETRIES = 3;
   var SPEED_SYNC_COOLDOWN_MS = 5000;
+  var VIDEO_WATCHDOG_INTERVAL_MS = 5000;
+  var VIDEO_STALL_TIMEOUT_MS = 30000;
+  var VIDEO_NEAR_END_SECONDS = 1.5;
+  var MAX_TRAINING_REVISITS = 3;
   var CONFIG_KEYS = {
     playbackRate: "yt_auto.playbackRate",
     targetCourseName: "yt_auto.targetCourseName",
@@ -95,7 +99,9 @@
     navigatingTo: "",
     navigationStartedAt: 0,
     lastUserGestureAt: 0,
-    panelRenderTimer: 0
+    panelRenderTimer: 0,
+    lastTrainingTarget: "",
+    trainingRevisits: 0
   };
 
   function getPageWindow() {
@@ -167,6 +173,8 @@
     state.completedRouteKey = "";
     state.running = false;
     state.navigatingTo = "";
+    state.lastTrainingTarget = "";
+    state.trainingRevisits = 0;
     setStatus(STATUS.idle, reason || "课程队列已重置");
   }
 
@@ -320,6 +328,8 @@
     state.completedRouteKey = "";
     state.running = false;
     state.navigatingTo = "";
+    state.lastTrainingTarget = "";
+    state.trainingRevisits = 0;
     setStatus(STATUS.scanning, "自动流程已启动");
     schedule(runRouter, 100);
   }
@@ -521,11 +531,18 @@
     style.textContent = [
       "#yt-auto-panel{position:fixed;top:72px;right:18px;z-index:2147483647;width:320px;max-width:calc(100vw - 36px);font:13px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1f2937;background:#fff;border:1px solid #d1d5db;border-radius:8px;box-shadow:0 14px 34px rgba(0,0,0,.16);overflow:hidden}",
       "#yt-auto-panel *{box-sizing:border-box}",
-      "#yt-auto-panel header{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#f3f4f6;border-bottom:1px solid #e5e7eb;font-weight:700}",
+      "#yt-auto-panel header{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#f3f4f6;border-bottom:1px solid #e5e7eb;font-weight:700;cursor:move;user-select:none}",
       "#yt-auto-panel main{padding:10px 12px}",
       "#yt-auto-panel .yt-row{display:flex;gap:8px;align-items:center;margin:8px 0}",
-      "#yt-auto-panel .yt-status{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px}",
-      "#yt-auto-panel .yt-badge{flex:0 0 auto;min-width:54px;text-align:center;border-radius:999px;padding:2px 8px;background:#e5e7eb;color:#111827;font-size:12px}",
+      "#yt-auto-panel .yt-status{display:flex;gap:8px;align-items:flex-start;margin-bottom:4px}",
+      "#yt-auto-panel .yt-flow{margin:0 0 8px;color:#6b7280;font-size:12px}",
+      "#yt-auto-panel .yt-badge{flex:0 0 auto;min-width:54px;text-align:center;border-radius:999px;padding:2px 8px;background:#e5e7eb;color:#111827;font-size:12px;font-weight:600}",
+      "#yt-auto-panel .yt-badge[data-variant='playing']{background:#dbeafe;color:#1d4ed8}",
+      "#yt-auto-panel .yt-badge[data-variant='scanning']{background:#fef3c7;color:#92400e}",
+      "#yt-auto-panel .yt-badge[data-variant='complete']{background:#dcfce7;color:#166534}",
+      "#yt-auto-panel .yt-badge[data-variant='paused']{background:#f1f5f9;color:#475569}",
+      "#yt-auto-panel .yt-badge[data-variant='error']{background:#fee2e2;color:#b91c1c}",
+      "#yt-auto-panel .yt-badge[data-variant='idle']{background:#e5e7eb;color:#374151}",
       "#yt-auto-panel .yt-msg{min-width:0;word-break:break-word;color:#374151}",
       "#yt-auto-panel button{height:30px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#111827;padding:0 10px;cursor:pointer;white-space:nowrap}",
       "#yt-auto-panel button:hover{background:#f8fafc}",
@@ -553,6 +570,7 @@
       "</header>",
       "<main>",
       "  <div class='yt-status'><span class='yt-badge' data-role='status'></span><span class='yt-msg' data-role='message'></span></div>",
+      "  <div class='yt-flow' data-role='flow'></div>",
       "  <div class='yt-row'>",
       "    <button class='yt-primary' type='button' data-action='start'>一键启动</button>",
       "    <button type='button' data-action='scan'>扫描课程并进入</button>",
@@ -618,7 +636,44 @@
       }
     });
 
+    makePanelDraggable(panel);
     renderPanel();
+  }
+
+  function makePanelDraggable(panel) {
+    var header = panel.querySelector("header");
+    if (!header) return;
+    var dragging = false;
+    var startX = 0;
+    var startY = 0;
+    var startLeft = 0;
+    var startTop = 0;
+
+    header.addEventListener("mousedown", function (event) {
+      if (event.button !== 0 || (event.target instanceof Element && event.target.closest(".yt-collapse"))) return;
+      var rect = panel.getBoundingClientRect();
+      dragging = true;
+      startX = event.clientX;
+      startY = event.clientY;
+      startLeft = rect.left;
+      startTop = rect.top;
+      panel.style.left = startLeft + "px";
+      panel.style.top = startTop + "px";
+      panel.style.right = "auto";
+      event.preventDefault();
+    });
+    window.addEventListener("mousemove", function (event) {
+      if (!dragging) return;
+      var maxX = Math.max(0, window.innerWidth - panel.offsetWidth);
+      var maxY = Math.max(0, window.innerHeight - panel.offsetHeight);
+      var nextX = startLeft + (event.clientX - startX);
+      var nextY = startTop + (event.clientY - startY);
+      panel.style.left = Math.max(0, Math.min(nextX, maxX)) + "px";
+      panel.style.top = Math.max(0, Math.min(nextY, maxY)) + "px";
+    });
+    window.addEventListener("mouseup", function () {
+      dragging = false;
+    });
   }
 
   function requestRenderPanel() {
@@ -648,14 +703,19 @@
     var config = readConfig();
     var status = panel.querySelector("[data-role='status']");
     var message = panel.querySelector("[data-role='message']");
+    var flow = panel.querySelector("[data-role='flow']");
     var logs = panel.querySelector("[data-role='logs']");
     var items = panel.querySelector("[data-role='items']");
     var autoStart = panel.querySelector("[data-field='autoStart']");
     var playbackRate = panel.querySelector("[data-field='playbackRate']");
     var targetCourseName = panel.querySelector("[data-field='targetCourseName']");
 
-    if (status) status.textContent = state.status;
+    if (status) {
+      status.textContent = state.status;
+      status.setAttribute("data-variant", statusVariant(state.status));
+    }
     if (message) message.textContent = state.message || "";
+    if (flow) flow.textContent = describeFlow();
     if (autoStart) autoStart.checked = config.autoStart;
     if (playbackRate && document.activeElement !== playbackRate) playbackRate.value = String(config.playbackRate);
     if (targetCourseName && document.activeElement !== targetCourseName) targetCourseName.value = config.targetCourseName;
@@ -665,6 +725,29 @@
       }).join("");
     }
     if (items) renderItems(items);
+  }
+
+  function statusVariant(status) {
+    if (status === STATUS.playing) return "playing";
+    if (status === STATUS.scanning) return "scanning";
+    if (status === STATUS.complete) return "complete";
+    if (status === STATUS.paused) return "paused";
+    if (status === STATUS.error) return "error";
+    return "idle";
+  }
+
+  function describeFlow() {
+    var queue = readQueue();
+    var phaseLabel = queue.phase === "selecting"
+      ? "选课中"
+      : (queue.phase === "learning" ? "学习中" : "未开始");
+    var text = "阶段：" + phaseLabel;
+    if (queue.items.length) {
+      text += " · 队列 " + Math.min(queue.index + 1, queue.items.length) + "/" + queue.items.length;
+    }
+    var config = readConfig();
+    text += " · 倍速 " + config.playbackRate + "x";
+    return text;
   }
 
   function renderItems(container) {
@@ -815,7 +898,7 @@
         handleRecoverableError(error, "路由执行失败");
       }
     }).finally(function () {
-      if (state.routeRunKey === key && name !== "video") state.running = false;
+      if (state.routeRunKey === key) state.running = false;
     });
   }
 
@@ -1122,6 +1205,11 @@
 
   function handleMyTrainingPage(config) {
     var queue = readQueue();
+    if (queue.phase === "selecting" && queue.items.length && queue.index < queue.items.length) {
+      // 选课尚未完成，不要清空队列，继续推进选课流程。
+      goToQueuedCourse("继续选课流程");
+      return Promise.resolve();
+    }
     writeQueue([], 0, queue.source, {
       phase: "learning",
       myTrainingUrl: location.href
@@ -1143,7 +1231,19 @@
         return !row.complete && row.action;
       });
       if (!next) {
+        state.lastTrainingTarget = "";
+        state.trainingRevisits = 0;
         setStatus(STATUS.complete, "已选课程全部完成");
+        return;
+      }
+      if (state.lastTrainingTarget === next.title) {
+        state.trainingRevisits += 1;
+      } else {
+        state.lastTrainingTarget = next.title;
+        state.trainingRevisits = 0;
+      }
+      if (state.trainingRevisits >= MAX_TRAINING_REVISITS) {
+        pause("课程“" + next.title + "”进度长时间未同步为已完成，疑似循环，请手动检查");
         return;
       }
       clickElement(next.action, "进入未完成课程 " + next.title + "（" + next.progressText + "）");
@@ -1248,15 +1348,11 @@
   }
 
   function handleStudyContentPage(config) {
-    setStatus(STATUS.scanning, "等待学习内容页刷新");
-    return delay(ROUTE_STABLE_WAIT_MS).then(function () {
-      if (isPaused()) return null;
-      setStatus(STATUS.scanning, "等待章节列表");
-      return retryWait(function () {
-        var chapters = scanChapters();
-        return chapters.length ? chapters : null;
-      }, "章节列表", config.maxRetries);
-    }).then(function (chapters) {
+    setStatus(STATUS.scanning, "等待章节列表");
+    return retryWait(function () {
+      var chapters = scanChapters();
+      return chapters.length ? chapters : null;
+    }, "章节列表", config.maxRetries).then(function (chapters) {
       if (isPaused()) return;
       if (!chapters) return;
       state.chapterItems = chapters;
@@ -1449,6 +1545,7 @@
   function handleVideoPage(config) {
     config = config || readConfig();
     state.handledEnd = false;
+    state.videoRetryCount = 0;
     setStatus(STATUS.playing, "等待播放器");
     return retryWait(function () {
       return findVideoElement();
@@ -1472,6 +1569,8 @@
   }
 
   function attachVideoAutomation(video, config) {
+    if (video.__ytAutoAttached) return;
+    video.__ytAutoAttached = true;
     setStatus(STATUS.playing, "已接管播放器，目标倍速 " + config.playbackRate + "x");
     applyYuketangPlayerDefaults(video, config.playbackRate);
 
@@ -1513,13 +1612,90 @@
     video.addEventListener("error", onError);
     var stopObserveRate = observeYuketangRate(video);
     var stopObservePause = observeYuketangPause(video);
+    var stopWatchdog = startVideoWatchdog(video);
     state.observerDisposers.push(function () {
       video.removeEventListener("timeupdate", onProgress);
       video.removeEventListener("ended", onEnded);
       video.removeEventListener("error", onError);
       if (stopObserveRate) stopObserveRate();
       if (stopObservePause) stopObservePause();
+      if (stopWatchdog) stopWatchdog();
+      video.__ytAutoAttached = false;
     });
+  }
+
+  function detectVideoQuizPopup() {
+    var nodes = Array.from(document.querySelectorAll(
+      ".xt_video_player_problem,[class*='video-problem' i],[class*='problembox' i],[class*='problem-box' i],[class*='subject-problem' i],.exercise-container"
+    ));
+    return nodes.some(function (node) {
+      if (!isVisible(node)) return false;
+      var text = textOf(node);
+      return text.length > 0 && text.length < 800 && /提交|作答|答题|单选|多选|投票|本视频/.test(text);
+    });
+  }
+
+  function startVideoWatchdog(video) {
+    if (!video) return function () {};
+    var lastTime = -1;
+    var lastAdvanceAt = Date.now();
+    var stallCount = 0;
+    var nudgeCount = 0;
+
+    var timer = window.setInterval(function () {
+      if (state.handledEnd || isPaused() || video.ended) return;
+      if (video.paused && detectVideoQuizPopup()) {
+        pause("检测到视频内弹题，请手动作答后点击“一键启动”继续");
+        return;
+      }
+      var now = Date.now();
+      var current = Number(video.currentTime) || 0;
+      var duration = Number(video.duration) || 0;
+      if (Math.abs(current - lastTime) > 0.25) {
+        lastTime = current;
+        lastAdvanceAt = now;
+        stallCount = 0;
+        nudgeCount = 0;
+        return;
+      }
+      if (now - lastAdvanceAt < VIDEO_STALL_TIMEOUT_MS) return;
+      lastAdvanceAt = now;
+
+      if (duration > 0 && current >= duration - VIDEO_NEAR_END_SECONDS) {
+        nudgeCount += 1;
+        log("视频停在结尾但未触发完成，尝试推动结束（" + nudgeCount + "）");
+        try {
+          video.currentTime = duration;
+          playYuketangVideo(video, "near-end-nudge", { force: true });
+        } catch (error) {
+          console.warn(error);
+        }
+        if (nudgeCount >= 3 && !state.handledEnd) {
+          state.handledEnd = true;
+          log("多次推动仍未触发 ended，进入完成同步流程");
+          goNextAfterVideo(video);
+        }
+        return;
+      }
+
+      stallCount += 1;
+      var maxRetries = readConfig().maxRetries;
+      if (stallCount > 3 + maxRetries) {
+        pause("视频长时间无法继续播放，请检查网络后手动处理");
+        return;
+      }
+      setStatus(STATUS.playing, "视频卡住，尝试恢复播放（" + stallCount + "）");
+      try {
+        if (stallCount > 3) video.load();
+        playYuketangVideo(video, "stall-recover", { force: true });
+      } catch (error) {
+        console.warn(error);
+      }
+    }, VIDEO_WATCHDOG_INTERVAL_MS);
+
+    return function () {
+      window.clearInterval(timer);
+    };
   }
 
   function applyYuketangMediaDefaults(video) {
@@ -1810,19 +1986,21 @@
     setStatus(STATUS.scanning, "等待平台同步视频完成状态");
     waitForYuketangVideoEndSync(video).then(function () {
       if (isPaused()) return;
-      setStatus(STATUS.scanning, "准备跳转下一节");
+      setStatus(STATUS.scanning, "准备进入下一节视频");
+      // 优先返回学习内容页重新扫描：findNextPlayableChapter 只会选未完成的视频节点，
+      // 避免“下一节”按钮把流程带到文档/讨论/作业等非视频内容上而卡死。
+      var studyUrl = buildStudyContentUrl();
+      if (studyUrl) {
+        log("等待平台同步后返回学习内容页扫描下一节视频");
+        delay(POST_VIDEO_RESCAN_WAIT_MS).then(function () {
+          if (!isPaused()) navigateTo(studyUrl, "返回学习内容页重新扫描");
+        });
+        return;
+      }
       var next = findNextButton();
       if (next) {
         next.dispatchEvent(new Event("mousemove", { bubbles: true }));
         clickElement(next, "跳转下一节");
-        return;
-      }
-      var studyUrl = buildStudyContentUrl();
-      if (studyUrl) {
-        log("未找到下一节按钮，等待平台同步后返回学习内容页重新扫描");
-        delay(POST_VIDEO_RESCAN_WAIT_MS).then(function () {
-          if (!isPaused()) navigateTo(studyUrl, "返回学习内容页重新扫描");
-        });
         return;
       }
       var queue = readQueue();
