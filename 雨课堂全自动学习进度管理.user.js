@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.3.0
-// @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节。
+// @version      0.4.0
+// @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
 // @match        https://kmustyjscfd.yuketang.cn/pro/*
@@ -219,8 +219,9 @@
       clickElement(item.action, "进入队列课程 " + item.title);
       return true;
     }
-    pause("队列课程缺少可进入链接：" + item.title);
-    return false;
+    // 该队列项没有可进入的链接：跳过它，保持自动流程继续。
+    log("队列课程缺少可进入链接，已跳过：" + item.title);
+    return advanceQueue("跳过无法进入的课程");
   }
 
   function finishSelectionPhase(reason) {
@@ -456,8 +457,32 @@
     return true;
   }
 
+  function refreshCountKey() {
+    return "yt_auto.refresh:" + location.pathname;
+  }
+
+  function clearRefreshCount() {
+    try { window.sessionStorage.removeItem(refreshCountKey()); } catch (error) { /* ignore */ }
+  }
+
+  // 出现可恢复的故障时刷新当前页重试，并始终保持自动模式开启（除非用户手动暂停）。
+  // 用逐步拉长的退避间隔避免在真正损坏的页面上疯狂刷新。
+  function refreshCurrentPage(reason) {
+    if (isPaused()) return;
+    var key = refreshCountKey();
+    var count = 0;
+    try { count = Number(window.sessionStorage.getItem(key) || 0) || 0; } catch (error) { count = 0; }
+    try { window.sessionStorage.setItem(key, String(count + 1)); } catch (error) { /* ignore */ }
+    var delayMs = count < 3 ? 2000 : (count < 6 ? 15000 : 60000);
+    setStatus(STATUS.error, reason + "，" + Math.round(delayMs / 1000) + " 秒后刷新本页重试（第 " + (count + 1) + " 次，自动模式保持开启）");
+    schedule(function () {
+      if (!isPaused()) location.reload();
+    }, delayMs);
+  }
+
   function navigateTo(url, reason) {
     if (!url) return false;
+    clearRefreshCount();
     var absoluteUrl = new URL(url, location.href).href;
     state.navigatingTo = absoluteUrl;
     state.navigationStartedAt = Date.now();
@@ -1243,7 +1268,9 @@
         state.trainingRevisits = 0;
       }
       if (state.trainingRevisits >= MAX_TRAINING_REVISITS) {
-        pause("课程“" + next.title + "”进度长时间未同步为已完成，疑似循环，请手动检查");
+        // 进度迟迟未同步：不退出自动模式，刷新培训进度页等待平台回写后再继续。
+        state.trainingRevisits = 0;
+        refreshCurrentPage("课程“" + next.title + "”进度未同步为已完成");
         return;
       }
       clickElement(next.action, "进入未完成课程 " + next.title + "（" + next.progressText + "）");
@@ -1301,7 +1328,8 @@
           return null;
         });
         if (!selectedButton) {
-          pause("选课后未确认成功，请手动检查");
+          // 不退出自动模式：刷新课程详情页确认选课结果后继续。
+          refreshCurrentPage("选课结果未确认");
           return;
         }
         advanceQueue("选课完成，继续下一门");
@@ -1314,7 +1342,7 @@
         return findCoursePrimaryButton();
       });
       if (!learnButton) {
-        pause("选课后未找到去学习按钮");
+        refreshCurrentPage("选课后未找到去学习按钮");
         return;
       }
       clickElement(learnButton, "选课后进入学习");
@@ -1336,7 +1364,7 @@
       navigateTo(queueItem.studyUrl, "进入学习页");
       return;
     }
-    pause("课程详情页未找到可执行操作");
+    refreshCurrentPage("课程详情页未找到可执行操作");
   }
 
   function chooseCourse(courses, config) {
@@ -1589,22 +1617,26 @@
       goNextAfterVideo(video);
     };
     var onError = function () {
-      if (isPaused()) return;
+      if (isPaused() || state.handledEnd) return;
       var maxRetries = readConfig().maxRetries;
       state.videoRetryCount += 1;
-      if (state.videoRetryCount > maxRetries) {
-        pause("视频加载失败，请手动检查网络或播放器");
+      var mediaError = video.error ? ("错误码 " + video.error.code) : "未知错误";
+      if (state.videoRetryCount <= maxRetries) {
+        // 先就地重载，处理瞬时网络抖动。
+        setStatus(STATUS.playing, "视频加载失败（" + mediaError + "），5 秒后重试 " + state.videoRetryCount + "/" + maxRetries);
+        schedule(function () {
+          if (isPaused() || state.handledEnd) return;
+          try {
+            video.load();
+            playYuketangVideo(video, "error-retry", { force: true });
+          } catch (error) {
+            console.warn(error);
+          }
+        }, 5000);
         return;
       }
-      setStatus(STATUS.playing, "视频加载失败，10 秒后重试 " + state.videoRetryCount + "/" + maxRetries);
-      schedule(function () {
-        try {
-          video.load();
-          playYuketangVideo(video, "error-retry", { force: true });
-        } catch (error) {
-          console.warn(error);
-        }
-      }, 10000);
+      // 就地重载无效，多半是播放凭证过期：整页刷新换取新的视频地址，而不是反复加载同一个失效链接。
+      refreshCurrentPage("视频反复加载失败（" + mediaError + "）");
     };
 
     video.addEventListener("timeupdate", onProgress);
@@ -1645,7 +1677,8 @@
     var timer = window.setInterval(function () {
       if (state.handledEnd || isPaused() || video.ended) return;
       if (video.paused && detectVideoQuizPopup()) {
-        pause("检测到视频内弹题，请手动作答后点击“一键启动”继续");
+        // 弹题需要人工作答；不退出自动模式，作答后会自动继续播放。
+        setStatus(STATUS.playing, "检测到视频内弹题，等待手动作答后自动继续");
         return;
       }
       var now = Date.now();
@@ -1681,7 +1714,8 @@
       stallCount += 1;
       var maxRetries = readConfig().maxRetries;
       if (stallCount > 3 + maxRetries) {
-        pause("视频长时间无法继续播放，请检查网络后手动处理");
+        // 卡死多半也是加载/凭证问题：刷新当前页重试，保持自动模式。
+        refreshCurrentPage("视频长时间无法继续播放");
         return;
       }
       setStatus(STATUS.playing, "视频卡住，尝试恢复播放（" + stallCount + "）");
@@ -1960,6 +1994,7 @@
     var onPlaying = function () {
       var runtime = videoRuntime(video);
       if (runtime) runtime.restoreRetries = 0;
+      clearRefreshCount();
       clearVideoResumeTimer(video);
     };
 
@@ -2011,7 +2046,7 @@
         });
         return;
       }
-      pause("无法确定下一节或学习内容页地址");
+      refreshCurrentPage("无法确定下一节或学习内容页地址");
     });
   }
 
@@ -2186,7 +2221,8 @@
         return;
       }
     }
-    pause(fallbackMessage + "，请手动干预");
+    // 保持自动模式：刷新当前页重试，而不是直接暂停等待人工。
+    refreshCurrentPage(fallbackMessage);
   }
 
   function installNavigationHooks() {
