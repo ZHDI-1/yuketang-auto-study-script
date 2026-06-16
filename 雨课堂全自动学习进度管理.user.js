@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.2.7
+// @version      0.2.8
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节。
 // @author       local
 // @license      GPL-3.0-only
@@ -1428,7 +1428,6 @@
 
     var onProgress = function () {
       if (state.handledEnd || isPaused()) return;
-      applyYuketangMediaDefaults(video, config.playbackRate);
       if (isVideoNearlyEnded(video)) {
         state.handledEnd = true;
         log("检测到视频已到结尾");
@@ -1461,15 +1460,11 @@
     };
 
     video.addEventListener("timeupdate", onProgress);
-    video.addEventListener("progress", onProgress);
-    video.addEventListener("durationchange", onProgress);
     video.addEventListener("ended", onEnded);
     video.addEventListener("error", onError);
     var stopObservePause = observeYuketangPause(video);
     state.observerDisposers.push(function () {
       video.removeEventListener("timeupdate", onProgress);
-      video.removeEventListener("progress", onProgress);
-      video.removeEventListener("durationchange", onProgress);
       video.removeEventListener("ended", onEnded);
       video.removeEventListener("error", onError);
       if (stopObservePause) stopObservePause();
@@ -1483,13 +1478,15 @@
   function applyYuketangMediaDefaults(video, targetRate) {
     if (!video) return;
     try {
-      video.muted = true;
-      video.defaultMuted = true;
-      video.volume = 0;
-      video.setAttribute("muted", "muted");
-      video.setAttribute("playsinline", "playsinline");
-      video.setAttribute("webkit-playsinline", "webkit-playsinline");
-      video.playbackRate = targetRate;
+      if (!video.muted) video.muted = true;
+      if (!video.defaultMuted) video.defaultMuted = true;
+      if (video.volume !== 0) video.volume = 0;
+      if (!video.hasAttribute("muted")) video.setAttribute("muted", "muted");
+      if (!video.hasAttribute("playsinline")) video.setAttribute("playsinline", "playsinline");
+      if (!video.hasAttribute("webkit-playsinline")) video.setAttribute("webkit-playsinline", "webkit-playsinline");
+      if (Math.abs(Number(video.playbackRate || 1) - Number(targetRate)) > 0.05) {
+        video.playbackRate = targetRate;
+      }
     } catch (error) {
       log("设置播放器默认参数失败：" + error.message);
     }
