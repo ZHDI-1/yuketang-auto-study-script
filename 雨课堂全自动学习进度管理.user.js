@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.2.9
+// @version      0.2.10
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节。
 // @author       local
 // @license      GPL-3.0-only
@@ -28,6 +28,8 @@
   var SCRIPT_NAME = "雨课堂自动学习";
   var ROUTE_STABLE_WAIT_MS = 5000;
   var POST_VIDEO_RESCAN_WAIT_MS = 5000;
+  var VIDEO_END_SYNC_WAIT_MS = 7000;
+  var POST_HEARTBACK_SETTLE_MS = 1500;
   var CONFIG_KEYS = {
     playbackRate: "yt_auto.playbackRate",
     targetCourseName: "yt_auto.targetCourseName",
@@ -1441,14 +1443,14 @@
       if (isVideoNearlyEnded(video)) {
         state.handledEnd = true;
         log("检测到视频已到结尾");
-        goNextAfterVideo();
+        goNextAfterVideo(video);
       }
     };
     var onEnded = function () {
       if (state.handledEnd || isPaused()) return;
       state.handledEnd = true;
       log("检测到 ended 事件");
-      goNextAfterVideo();
+      goNextAfterVideo(video);
     };
     var onError = function () {
       if (isPaused()) return;
@@ -1702,10 +1704,11 @@
     return Boolean(video && video.ended);
   }
 
-  function goNextAfterVideo() {
-    setStatus(STATUS.scanning, "准备跳转下一节");
-    schedule(function () {
+  function goNextAfterVideo(video) {
+    setStatus(STATUS.scanning, "等待平台同步视频完成状态");
+    waitForYuketangVideoEndSync(video).then(function () {
       if (isPaused()) return;
+      setStatus(STATUS.scanning, "准备跳转下一节");
       var next = findNextButton();
       if (next) {
         next.dispatchEvent(new Event("mousemove", { bubbles: true }));
@@ -1729,7 +1732,121 @@
         return;
       }
       pause("无法确定下一节或学习内容页地址");
-    }, 1200);
+    });
+  }
+
+  function waitForYuketangVideoEndSync(video) {
+    return new Promise(function (resolve) {
+      var context = findYuketangPlayerContext();
+      var player = context.player;
+      var settled = false;
+      var fallbackTimer = null;
+      var flushAttempted = false;
+
+      function detach(handler) {
+        if (!player || !handler) return;
+        try {
+          if (typeof player.off === "function") {
+            player.off("heartback", handler);
+          } else if (typeof player.removeListener === "function") {
+            player.removeListener("heartback", handler);
+          } else if (player.eventArr && Array.isArray(player.eventArr.heartback)) {
+            player.eventArr.heartback = player.eventArr.heartback.filter(function (item) {
+              return item !== handler;
+            });
+          }
+        } catch (error) {
+          console.warn(error);
+        }
+      }
+
+      function restartFallbackTimer(handler) {
+        if (fallbackTimer) {
+          window.clearTimeout(fallbackTimer);
+          state.timers = state.timers.filter(function (item) { return item !== fallbackTimer; });
+        }
+        fallbackTimer = schedule(function () {
+          if (tryFlushPendingVideoEnd(handler, "等待超时")) return;
+          finish("等待超时兜底", handler);
+        }, VIDEO_END_SYNC_WAIT_MS);
+      }
+
+      function getHeartbeatParams() {
+        return player && player.heartBeat && player.heartBeat.params ? player.heartBeat.params : {};
+      }
+
+      function isCurrentVideoEndLog(log) {
+        var params = getHeartbeatParams();
+        if (!log || log.et !== "videoend") return false;
+        if (params.v && String(log.v) !== String(params.v)) return false;
+        if (params.c && String(log.c) !== String(params.c)) return false;
+        if (params.classroomid && String(log.classroomid) !== String(params.classroomid)) return false;
+        return true;
+      }
+
+      function hasPendingVideoEndLog() {
+        var store = safeJsonParse(window.localStorage.getItem("nhd"), {});
+        return Object.keys(store).some(function (key) {
+          return isCurrentVideoEndLog(store[key]);
+        });
+      }
+
+      function tryFlushPendingVideoEnd(handler, reason) {
+        if (flushAttempted || !hasPendingVideoEndLog()) return false;
+        var heartBeat = player && player.heartBeat;
+        if (!heartBeat || typeof heartBeat.sendEvents !== "function") return false;
+        flushAttempted = true;
+        try {
+          if (video && video.duration && heartBeat.params) {
+            heartBeat.params.et = "videoend";
+            heartBeat.preVideoTime = video.duration;
+            if (typeof heartBeat.getParams === "function") heartBeat.getParams();
+          }
+          heartBeat.sendEvents();
+          log("检测到 videoend 仍在本地队列，已调用播放器原生 heartbeat flush（" + reason + "）");
+          restartFallbackTimer(handler);
+          return true;
+        } catch (error) {
+          log("刷新本地 videoend 队列失败：" + error.message);
+          return false;
+        }
+      }
+
+      function finish(reason, handler) {
+        if (settled) return;
+        settled = true;
+        if (fallbackTimer) {
+          window.clearTimeout(fallbackTimer);
+          state.timers = state.timers.filter(function (item) { return item !== fallbackTimer; });
+        }
+        detach(handler);
+        log("视频完成同步等待结束：" + reason);
+        delay(POST_HEARTBACK_SETTLE_MS).then(resolve);
+      }
+
+      var onHeartback = function () {
+        if (tryFlushPendingVideoEnd(onHeartback, "heartback 后仍有待发送日志")) return;
+        finish("收到 heartback", onHeartback);
+      };
+
+      if (player && typeof player.on === "function") {
+        try {
+          player.on("heartback", onHeartback);
+          log("等待雨课堂 videoend heartback 后再跳转");
+        } catch (error) {
+          log("监听 heartback 失败，使用兜底等待：" + error.message);
+        }
+      } else {
+        log("未找到播放器 heartback 事件，使用兜底等待");
+      }
+
+      if (video && !video.ended) {
+        finish("视频未处于 ended 状态", onHeartback);
+        return;
+      }
+
+      restartFallbackTimer(onHeartback);
+    });
   }
 
   function findNextButton() {
