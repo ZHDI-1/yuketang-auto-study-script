@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.5.3
+// @version      0.5.4
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
@@ -36,7 +36,6 @@
   var VIDEO_STALL_TIMEOUT_MS = 8000;
   var VIDEO_NEAR_END_SECONDS = 1.5;
   var MAX_STALL_RECOVERIES = 4;
-  var NAV_VERIFY_MS = 10000;
   var MAX_TRAINING_REVISITS = 3;
   var CONFIG_KEYS = {
     playbackRate: "yt_auto.playbackRate",
@@ -214,7 +213,7 @@
       return navigateTo(item.selectUrl, "进入选课详情 " + item.title);
     }
     if (item.action) {
-      clickToNavigate(item.action, "进入队列课程 " + item.title);
+      clickElement(item.action, "进入队列课程 " + item.title);
       return true;
     }
     // 该队列项没有可进入的链接：跳过它，保持自动流程继续。
@@ -455,22 +454,6 @@
     return true;
   }
 
-  // 点击一个本应触发页面跳转的元素，并在之后校验跳转是否真的发生。
-  // 雨课堂是 SPA，扫描到的按钮/节点可能在点击前被重新渲染替换；点到失效元素会静默无反应，
-  // 让整个流程卡死（与视频元素被移除属于同一类问题）。若一段时间后路由没变就刷新本页恢复。
-  function clickToNavigate(element, reason) {
-    if (!clickElement(element, reason)) return false;
-    var fromKey = currentRouteKey();
-    schedule(function () {
-      if (isPaused()) return;
-      if (currentRouteKey() !== fromKey) return;      // 已跳转
-      if (shouldWaitForNavigation()) return;          // 有整页跳转正在进行
-      log("点击后页面未跳转，疑似元素已失效，刷新本页恢复（" + reason + "）");
-      refreshCurrentPage("点击后未跳转：" + reason);
-    }, NAV_VERIFY_MS);
-    return true;
-  }
-
   function refreshCountKey() {
     return "yt_auto.refresh:" + location.pathname;
   }
@@ -535,7 +518,7 @@
     if (chapter.url) {
       return navigateTo(chapter.url, reason || chapter.title);
     }
-    return clickToNavigate(chapter.action || chapter.element, reason || ("进入章节 " + chapter.title));
+    return clickElement(chapter.action || chapter.element, reason || ("进入章节 " + chapter.title));
   }
 
   function routeName() {
@@ -1287,7 +1270,7 @@
         refreshCurrentPage("课程“" + next.title + "”进度未同步为已完成");
         return;
       }
-      clickToNavigate(next.action, "进入未完成课程 " + next.title + "（" + next.progressText + "）");
+      clickElement(next.action, "进入未完成课程 " + next.title + "（" + next.progressText + "）");
     });
   }
 
@@ -1359,7 +1342,7 @@
         refreshCurrentPage("选课后未找到去学习按钮");
         return;
       }
-      clickToNavigate(learnButton, "选课后进入学习");
+      clickElement(learnButton, "选课后进入学习");
       return;
     }
 
@@ -1368,7 +1351,7 @@
         advanceQueue("该课程已选，继续下一门");
         return;
       }
-      clickToNavigate(button, "自动进入学习");
+      clickElement(button, "自动进入学习");
       return;
     }
 
@@ -1975,7 +1958,7 @@
       var next = findNextButton();
       if (next) {
         next.dispatchEvent(new Event("mousemove", { bubbles: true }));
-        clickToNavigate(next, "跳转下一节");
+        clickElement(next, "跳转下一节");
         return;
       }
       var queue = readQueue();
