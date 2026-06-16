@@ -1,0 +1,1606 @@
+// ==UserScript==
+// @name         雨课堂全自动学习进度管理
+// @namespace    https://kmustyjscfd.yuketang.cn/
+// @version      0.2.0
+// @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节。
+// @author       local
+// @license      MIT
+// @match        https://kmustyjscfd.yuketang.cn/pro/*
+// @run-at       document-idle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  /*
+   * 合规声明：
+   * 本脚本仅供个人学习效率提升，所有操作均基于用户合法授权及浏览器已登录状态。
+   * 不篡改学习数据，不绕过平台验证码或安全机制。
+   * 使用者应遵守雨课堂服务条款，因违规使用产生的后果自负。
+   */
+
+  var SCRIPT_NAME = "雨课堂自动学习";
+  var CONFIG_KEYS = {
+    playbackRate: "yt_auto.playbackRate",
+    targetCourseName: "yt_auto.targetCourseName",
+    autoStart: "yt_auto.autoStart",
+    continueOnError: "yt_auto.continueOnError",
+    maxRetries: "yt_auto.maxRetries",
+    paused: "yt_auto.paused",
+    courseQueue: "yt_auto.courseQueue",
+    queueIndex: "yt_auto.queueIndex",
+    queueSource: "yt_auto.queueSource",
+    flowPhase: "yt_auto.flowPhase",
+    myTrainingUrl: "yt_auto.myTrainingUrl"
+  };
+  var DEFAULT_CONFIG = {
+    playbackRate: 2,
+    targetCourseName: "",
+    autoStart: true,
+    continueOnError: true,
+    maxRetries: 3,
+    paused: false,
+    courseQueue: [],
+    queueIndex: 0,
+    queueSource: "",
+    flowPhase: "",
+    myTrainingUrl: ""
+  };
+  var ROUTE = {
+    selectCourse: /\/pro\/trainingproject\/selectcourse\//,
+    myTraining: /\/pro\/trainingproject\/mytraining\/detail\/\d+/,
+    courseAbout: /\/pro\/portal\/about\/project_/,
+    studyContent: /\/pro\/lms\/[^/]+\/[^/]+\/studycontent(?:[/?#]|$)/,
+    video: /\/pro\/lms\/[^/]+\/[^/]+\/video\//
+  };
+  var STATUS = {
+    idle: "空闲",
+    scanning: "扫描中",
+    playing: "播放中",
+    complete: "完成",
+    paused: "已暂停",
+    error: "需干预"
+  };
+  var state = {
+    status: STATUS.idle,
+    message: "等待页面就绪",
+    logs: [],
+    courseItems: [],
+    chapterItems: [],
+    queueItems: [],
+    observerDisposers: [],
+    timers: [],
+    running: false,
+    videoRetryCount: 0,
+    handledEnd: false,
+    routeRunKey: "",
+    completedRouteKey: "",
+    navigatingTo: "",
+    navigationStartedAt: 0
+  };
+
+  function readConfig() {
+    return {
+      playbackRate: normalizeRate(GM_getValue(CONFIG_KEYS.playbackRate, DEFAULT_CONFIG.playbackRate)),
+      targetCourseName: String(GM_getValue(CONFIG_KEYS.targetCourseName, DEFAULT_CONFIG.targetCourseName) || "").trim(),
+      autoStart: Boolean(GM_getValue(CONFIG_KEYS.autoStart, DEFAULT_CONFIG.autoStart)),
+      continueOnError: Boolean(GM_getValue(CONFIG_KEYS.continueOnError, DEFAULT_CONFIG.continueOnError)),
+      maxRetries: Math.max(0, Number(GM_getValue(CONFIG_KEYS.maxRetries, DEFAULT_CONFIG.maxRetries)) || DEFAULT_CONFIG.maxRetries),
+      paused: Boolean(GM_getValue(CONFIG_KEYS.paused, DEFAULT_CONFIG.paused))
+    };
+  }
+
+  function writeConfig(patch) {
+    Object.keys(patch).forEach(function (name) {
+      if (CONFIG_KEYS[name]) {
+        GM_setValue(CONFIG_KEYS[name], patch[name]);
+      }
+    });
+  }
+
+  function safeJsonParse(value, fallback) {
+    try {
+      return value ? JSON.parse(value) : fallback;
+    } catch (error) {
+      return fallback;
+    }
+  }
+
+  function readQueue() {
+    var queue = safeJsonParse(GM_getValue(CONFIG_KEYS.courseQueue, "[]"), []);
+    if (!Array.isArray(queue)) queue = [];
+    var index = Number(GM_getValue(CONFIG_KEYS.queueIndex, DEFAULT_CONFIG.queueIndex)) || 0;
+    var source = String(GM_getValue(CONFIG_KEYS.queueSource, DEFAULT_CONFIG.queueSource) || "");
+    var phase = String(GM_getValue(CONFIG_KEYS.flowPhase, DEFAULT_CONFIG.flowPhase) || "");
+    var myTrainingUrl = String(GM_getValue(CONFIG_KEYS.myTrainingUrl, DEFAULT_CONFIG.myTrainingUrl) || "");
+    return {
+      items: queue,
+      index: Math.max(0, Math.min(index, queue.length)),
+      source: source,
+      phase: phase,
+      myTrainingUrl: myTrainingUrl
+    };
+  }
+
+  function writeQueue(items, index, source, patch) {
+    patch = patch || {};
+    GM_setValue(CONFIG_KEYS.courseQueue, JSON.stringify(items || []));
+    GM_setValue(CONFIG_KEYS.queueIndex, Math.max(0, Number(index) || 0));
+    if (source !== undefined) GM_setValue(CONFIG_KEYS.queueSource, String(source || ""));
+    if (patch.phase !== undefined) GM_setValue(CONFIG_KEYS.flowPhase, String(patch.phase || ""));
+    if (patch.myTrainingUrl !== undefined) GM_setValue(CONFIG_KEYS.myTrainingUrl, String(patch.myTrainingUrl || ""));
+    state.queueItems = items || [];
+    renderPanel();
+  }
+
+  function resetQueue(reason) {
+    writeQueue([], 0, "", { phase: "", myTrainingUrl: "" });
+    state.routeRunKey = "";
+    state.completedRouteKey = "";
+    state.running = false;
+    state.navigatingTo = "";
+    setStatus(STATUS.idle, reason || "课程队列已重置");
+  }
+
+  function currentQueueItem() {
+    var queue = readQueue();
+    return queue.items[queue.index] || null;
+  }
+
+  function delay(ms) {
+    return new Promise(function (resolve) {
+      schedule(resolve, ms);
+    });
+  }
+
+  function courseMatchesTarget(item, config) {
+    return !config.targetCourseName || item.title === config.targetCourseName || item.name === config.targetCourseName;
+  }
+
+  function currentCourseSign() {
+    var match = location.pathname.match(/\/(?:about|lms)\/(project_[^/?#]+)/);
+    if (match) return decodeURIComponent(match[1]);
+    return "";
+  }
+
+  function goToQueuedCourse(reason) {
+    var queue = readQueue();
+    state.queueItems = queue.items;
+    if (!queue.items.length) {
+      setStatus(STATUS.idle, "课程队列为空");
+      return false;
+    }
+    if (queue.index >= queue.items.length) {
+      setStatus(STATUS.complete, "课程队列已完成，请重置队列后重新开始");
+      return false;
+    }
+    var item = queue.items[queue.index];
+    setStatus(STATUS.scanning, (reason || "进入课程") + "：" + item.title + "（" + (queue.index + 1) + "/" + queue.items.length + "）");
+    if (item.selectUrl) {
+      return navigateTo(item.selectUrl, "进入选课详情 " + item.title);
+    }
+    if (item.action) {
+      clickElement(item.action, "进入队列课程 " + item.title);
+      return true;
+    }
+    pause("队列课程缺少可进入链接：" + item.title);
+    return false;
+  }
+
+  function finishSelectionPhase(reason) {
+    var queue = readQueue();
+    writeQueue(queue.items, queue.items.length, queue.source, {
+      phase: "learning",
+      myTrainingUrl: queue.myTrainingUrl || buildMyTrainingUrl()
+    });
+    var target = queue.myTrainingUrl || buildMyTrainingUrl();
+    if (target) {
+      setStatus(STATUS.scanning, reason || "选课完成，返回培训进度页");
+      return navigateTo(target, "返回培训进度页");
+    }
+    setStatus(STATUS.complete, reason || "选课完成");
+    return false;
+  }
+
+  function advanceQueue(reason) {
+    var queue = readQueue();
+    if (!queue.items.length) {
+      setStatus(STATUS.complete, reason || "当前课程已完成");
+      return false;
+    }
+    var nextIndex = Math.min(queue.index + 1, queue.items.length);
+    writeQueue(queue.items, nextIndex, queue.source, { phase: queue.phase, myTrainingUrl: queue.myTrainingUrl });
+    if (nextIndex >= queue.items.length) {
+      if (queue.phase === "selecting") return finishSelectionPhase("全部课程已选课");
+      setStatus(STATUS.complete, "全部队列课程已完成");
+      return false;
+    }
+    return goToQueuedCourse(reason || "进入下一门课程");
+  }
+
+  function syncQueueIndexToCurrentPage() {
+    var sign = currentCourseSign();
+    if (!sign) return;
+    var queue = readQueue();
+    if (queue.phase !== "selecting") return;
+    if (!queue.items.length) return;
+    var index = queue.items.findIndex(function (item) {
+      return item.sign === sign;
+    });
+    if (index >= 0 && index !== queue.index) {
+      writeQueue(queue.items, index, queue.source);
+      log("队列索引已同步到当前课程：" + queue.items[index].title);
+    }
+  }
+
+  function completeCurrentCourse(reason) {
+    var queue = readQueue();
+    if (queue.phase === "learning" || routeName() === "myTraining") {
+      var url = queue.myTrainingUrl || buildMyTrainingUrl();
+      if (url) {
+        setStatus(STATUS.scanning, reason || "当前课程完成，返回培训进度页");
+        return navigateTo(url, "返回培训进度页");
+      }
+    }
+    return advanceQueue(reason || "当前课程完成");
+  }
+
+  function normalizeRate(value) {
+    var rate = Number(value);
+    if (!Number.isFinite(rate) || rate <= 0) return DEFAULT_CONFIG.playbackRate;
+    return Math.min(16, Math.max(0.25, rate));
+  }
+
+  function log(message, data) {
+    var line = "[" + new Date().toLocaleTimeString() + "] " + message;
+    state.logs.unshift(line);
+    state.logs = state.logs.slice(0, 8);
+    if (data !== undefined) {
+      console.log("[" + SCRIPT_NAME + "] " + message, data);
+    } else {
+      console.log("[" + SCRIPT_NAME + "] " + message);
+    }
+    renderPanel();
+  }
+
+  function setStatus(status, message) {
+    state.status = status;
+    state.message = message || "";
+    log(status + (message ? "：" + message : ""));
+  }
+
+  function isPaused() {
+    return Boolean(readConfig().paused);
+  }
+
+  function pause(reason) {
+    writeConfig({ paused: true });
+    setStatus(STATUS.paused, reason || "自动流程已暂停");
+  }
+
+  function resume() {
+    writeConfig({ paused: false, autoStart: true });
+    state.routeRunKey = "";
+    state.completedRouteKey = "";
+    state.running = false;
+    state.navigatingTo = "";
+    setStatus(STATUS.scanning, "自动流程已启动");
+    schedule(runRouter, 100);
+  }
+
+  function schedule(fn, delay) {
+    var timer = window.setTimeout(function () {
+      state.timers = state.timers.filter(function (item) { return item !== timer; });
+      fn();
+    }, delay);
+    state.timers.push(timer);
+    return timer;
+  }
+
+  function clearManagedAsync() {
+    state.observerDisposers.forEach(function (dispose) {
+      try { dispose(); } catch (error) { console.warn(error); }
+    });
+    state.observerDisposers = [];
+    state.timers.forEach(function (timer) { window.clearTimeout(timer); });
+    state.timers = [];
+  }
+
+  function textOf(node) {
+    return (node && node.textContent ? node.textContent : "").replace(/\s+/g, " ").trim();
+  }
+
+  function isVisible(element) {
+    if (!element || !(element instanceof Element)) return false;
+    var style = window.getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+    var rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function uniqueByElement(items) {
+    var seen = new Set();
+    return items.filter(function (item) {
+      var key = item && (item.key || item.url || item.element);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function waitFor(predicate, options) {
+    var opts = Object.assign({
+      timeout: 15000,
+      interval: 400,
+      root: document.body || document.documentElement,
+      label: "元素"
+    }, options || {});
+
+    return new Promise(function (resolve, reject) {
+      var startedAt = Date.now();
+      var settled = false;
+      var interval = 0;
+      var observer = null;
+
+      function cleanup() {
+        if (interval) window.clearInterval(interval);
+        if (observer) observer.disconnect();
+        state.observerDisposers = state.observerDisposers.filter(function (dispose) { return dispose !== cleanup; });
+      }
+
+      function check() {
+        if (settled) return;
+        if (isPaused()) {
+          settled = true;
+          cleanup();
+          reject(new Error("自动流程已暂停"));
+          return;
+        }
+        var result = null;
+        try {
+          result = predicate();
+        } catch (error) {
+          settled = true;
+          cleanup();
+          reject(error);
+          return;
+        }
+        if (result) {
+          settled = true;
+          cleanup();
+          resolve(result);
+          return;
+        }
+        if (Date.now() - startedAt >= opts.timeout) {
+          settled = true;
+          cleanup();
+          reject(new Error("等待" + opts.label + "超时"));
+        }
+      }
+
+      interval = window.setInterval(check, opts.interval);
+      observer = new MutationObserver(check);
+      observer.observe(opts.root || document.documentElement, { childList: true, subtree: true, attributes: true });
+      state.observerDisposers.push(cleanup);
+      check();
+    });
+  }
+
+  function clickElement(element, reason) {
+    if (!element) return false;
+    log("触发：" + reason, element);
+    element.scrollIntoView({ block: "center", inline: "center" });
+    element.click();
+    return true;
+  }
+
+  function navigateTo(url, reason) {
+    if (!url) return false;
+    var absoluteUrl = new URL(url, location.href).href;
+    state.navigatingTo = absoluteUrl;
+    state.navigationStartedAt = Date.now();
+    log("跳转：" + (reason || absoluteUrl), absoluteUrl);
+    if (location.href === absoluteUrl) {
+      state.navigatingTo = "";
+      state.navigationStartedAt = 0;
+      schedule(runRouter, 300);
+      return true;
+    }
+    location.assign(absoluteUrl);
+    return true;
+  }
+
+  function currentRouteKey() {
+    return routeName() + "|" + location.href;
+  }
+
+  function shouldWaitForNavigation() {
+    if (!state.navigatingTo) return false;
+    if (location.href === state.navigatingTo) {
+      state.navigatingTo = "";
+      state.navigationStartedAt = 0;
+      return false;
+    }
+    if (Date.now() - state.navigationStartedAt > 6000) {
+      state.navigatingTo = "";
+      state.navigationStartedAt = 0;
+      return false;
+    }
+    return true;
+  }
+
+  function enterChapter(chapter, reason) {
+    if (!chapter) return false;
+    if (chapter.url) {
+      return navigateTo(chapter.url, reason || chapter.title);
+    }
+    return clickElement(chapter.action || chapter.element, reason || ("进入章节 " + chapter.title));
+  }
+
+  function routeName() {
+    var path = location.pathname;
+    if (ROUTE.selectCourse.test(path)) return "selectCourse";
+    if (ROUTE.myTraining.test(path)) return "myTraining";
+    if (ROUTE.courseAbout.test(path)) return "courseAbout";
+    if (ROUTE.studyContent.test(path)) return "studyContent";
+    if (ROUTE.video.test(path)) return "video";
+    return "unknown";
+  }
+
+  function looksLoggedOut() {
+    var pageText = textOf(document.body);
+    if (!pageText) return false;
+    return /请先登录|登录已失效|重新登录|账号登录|验证码登录|扫码登录/.test(pageText);
+  }
+
+  function ensureLoggedIn() {
+    if (looksLoggedOut()) {
+      pause("请先登录");
+      return false;
+    }
+    return true;
+  }
+
+  function initPanel() {
+    if (document.getElementById("yt-auto-panel")) return;
+
+    var style = document.createElement("style");
+    style.id = "yt-auto-panel-style";
+    style.textContent = [
+      "#yt-auto-panel{position:fixed;top:72px;right:18px;z-index:2147483647;width:320px;max-width:calc(100vw - 36px);font:13px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1f2937;background:#fff;border:1px solid #d1d5db;border-radius:8px;box-shadow:0 14px 34px rgba(0,0,0,.16);overflow:hidden}",
+      "#yt-auto-panel *{box-sizing:border-box}",
+      "#yt-auto-panel header{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#f3f4f6;border-bottom:1px solid #e5e7eb;font-weight:700}",
+      "#yt-auto-panel main{padding:10px 12px}",
+      "#yt-auto-panel .yt-row{display:flex;gap:8px;align-items:center;margin:8px 0}",
+      "#yt-auto-panel .yt-status{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px}",
+      "#yt-auto-panel .yt-badge{flex:0 0 auto;min-width:54px;text-align:center;border-radius:999px;padding:2px 8px;background:#e5e7eb;color:#111827;font-size:12px}",
+      "#yt-auto-panel .yt-msg{min-width:0;word-break:break-word;color:#374151}",
+      "#yt-auto-panel button{height:30px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#111827;padding:0 10px;cursor:pointer;white-space:nowrap}",
+      "#yt-auto-panel button:hover{background:#f8fafc}",
+      "#yt-auto-panel button.yt-primary{background:#2563eb;border-color:#2563eb;color:#fff}",
+      "#yt-auto-panel button.yt-danger{background:#dc2626;border-color:#dc2626;color:#fff}",
+      "#yt-auto-panel input{height:30px;min-width:0;border:1px solid #cbd5e1;border-radius:6px;padding:0 8px;background:#fff;color:#111827}",
+      "#yt-auto-panel label{display:flex;align-items:center;gap:6px;color:#374151}",
+      "#yt-auto-panel .yt-list{max-height:180px;overflow:auto;border-top:1px solid #e5e7eb;margin-top:8px;padding-top:8px}",
+      "#yt-auto-panel .yt-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid #f3f4f6}",
+      "#yt-auto-panel .yt-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      "#yt-auto-panel .yt-meta{font-size:12px;color:#6b7280}",
+      "#yt-auto-panel .yt-log{max-height:100px;overflow:auto;margin-top:8px;padding-top:8px;border-top:1px solid #e5e7eb;color:#4b5563;font-size:12px}",
+      "#yt-auto-panel .yt-log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      "#yt-auto-panel.yt-collapsed main{display:none}",
+      "#yt-auto-panel.yt-collapsed{width:auto}",
+      "#yt-auto-panel .yt-collapse{height:24px;padding:0 8px}"
+    ].join("");
+
+    var panel = document.createElement("section");
+    panel.id = "yt-auto-panel";
+    panel.innerHTML = [
+      "<header>",
+      "  <span>雨课堂自动学习</span>",
+      "  <button class='yt-collapse' type='button' title='折叠/展开'>−</button>",
+      "</header>",
+      "<main>",
+      "  <div class='yt-status'><span class='yt-badge' data-role='status'></span><span class='yt-msg' data-role='message'></span></div>",
+      "  <div class='yt-row'>",
+      "    <button class='yt-primary' type='button' data-action='start'>一键启动</button>",
+      "    <button type='button' data-action='scan'>扫描课程并进入</button>",
+      "    <button type='button' data-action='resetQueue'>重置队列</button>",
+      "    <button class='yt-danger' type='button' data-action='pause'>暂停自动</button>",
+      "  </div>",
+      "  <div class='yt-row'>",
+      "    <label><input type='checkbox' data-field='autoStart'>自动模式</label>",
+      "    <label>倍速 <input type='number' data-field='playbackRate' min='0.25' max='16' step='0.25' style='width:74px'></label>",
+      "  </div>",
+      "  <div class='yt-row'>",
+      "    <input type='text' data-field='targetCourseName' placeholder='指定课程名，留空选第一个' style='flex:1'>",
+      "    <button type='button' data-action='save'>保存</button>",
+      "  </div>",
+      "  <div class='yt-list' data-role='items'></div>",
+      "  <div class='yt-log' data-role='logs'></div>",
+      "</main>"
+    ].join("");
+
+    document.documentElement.appendChild(style);
+    document.documentElement.appendChild(panel);
+
+    panel.addEventListener("click", function (event) {
+      var target = event.target;
+      if (!(target instanceof Element)) return;
+      var collapse = target.closest(".yt-collapse");
+      if (collapse) {
+        panel.classList.toggle("yt-collapsed");
+        collapse.textContent = panel.classList.contains("yt-collapsed") ? "+" : "−";
+        return;
+      }
+      var action = target.getAttribute("data-action");
+      if (!action) {
+        var courseButton = target.closest("[data-course-index]");
+        if (courseButton) {
+          var index = Number(courseButton.getAttribute("data-course-index"));
+          var item = state.courseItems[index];
+          if (item) clickElement(item.action, "进入课程 " + item.title);
+        }
+        var chapterButton = target.closest("[data-chapter-index]");
+        if (chapterButton) {
+          var chapterIndex = Number(chapterButton.getAttribute("data-chapter-index"));
+          var chapter = state.chapterItems[chapterIndex];
+          if (chapter) enterChapter(chapter, "进入章节 " + chapter.title);
+        }
+        return;
+      }
+      if (action === "start") {
+        savePanelConfig();
+        resume();
+      } else if (action === "pause") {
+        pause("用户手动暂停");
+      } else if (action === "scan") {
+        savePanelConfig();
+        writeConfig({ paused: false });
+        manualScanCurrentPage();
+      } else if (action === "resetQueue") {
+        resetQueue("用户已重置课程队列");
+      } else if (action === "save") {
+        savePanelConfig();
+        setStatus(STATUS.idle, "配置已保存");
+      }
+    });
+
+    renderPanel();
+  }
+
+  function savePanelConfig() {
+    var panel = document.getElementById("yt-auto-panel");
+    if (!panel) return;
+    var autoStart = panel.querySelector("[data-field='autoStart']");
+    var playbackRate = panel.querySelector("[data-field='playbackRate']");
+    var targetCourseName = panel.querySelector("[data-field='targetCourseName']");
+    writeConfig({
+      autoStart: autoStart ? autoStart.checked : DEFAULT_CONFIG.autoStart,
+      playbackRate: playbackRate ? normalizeRate(playbackRate.value) : DEFAULT_CONFIG.playbackRate,
+      targetCourseName: targetCourseName ? targetCourseName.value.trim() : ""
+    });
+  }
+
+  function renderPanel() {
+    var panel = document.getElementById("yt-auto-panel");
+    if (!panel) return;
+    var config = readConfig();
+    var status = panel.querySelector("[data-role='status']");
+    var message = panel.querySelector("[data-role='message']");
+    var logs = panel.querySelector("[data-role='logs']");
+    var items = panel.querySelector("[data-role='items']");
+    var autoStart = panel.querySelector("[data-field='autoStart']");
+    var playbackRate = panel.querySelector("[data-field='playbackRate']");
+    var targetCourseName = panel.querySelector("[data-field='targetCourseName']");
+
+    if (status) status.textContent = state.status;
+    if (message) message.textContent = state.message || "";
+    if (autoStart) autoStart.checked = config.autoStart;
+    if (playbackRate && document.activeElement !== playbackRate) playbackRate.value = String(config.playbackRate);
+    if (targetCourseName && document.activeElement !== targetCourseName) targetCourseName.value = config.targetCourseName;
+    if (logs) {
+      logs.innerHTML = state.logs.map(function (line) {
+        return "<div title='" + escapeHtml(line) + "'>" + escapeHtml(line) + "</div>";
+      }).join("");
+    }
+    if (items) renderItems(items);
+  }
+
+  function renderItems(container) {
+    var name = routeName();
+    var queue = readQueue();
+    var queueMeta = queue.items.length
+      ? "<div class='yt-meta'>课程队列：" + Math.min(queue.index + 1, queue.items.length) + "/" + queue.items.length + "</div>"
+      : "";
+    if (name === "selectCourse") {
+      container.innerHTML = queueMeta + (state.courseItems.length ? state.courseItems.map(function (item, index) {
+        return [
+          "<div class='yt-item'>",
+          "  <div class='yt-title' title='" + escapeHtml(item.title) + "'>" + escapeHtml(item.title) + "</div>",
+          "  <button type='button' data-course-index='" + index + "'>进入</button>",
+          "</div>"
+        ].join("");
+      }).join("") : "<div class='yt-meta'>尚未扫描到课程</div>");
+      return;
+    }
+    if (name === "studyContent") {
+      container.innerHTML = queueMeta + (state.chapterItems.length ? state.chapterItems.slice(0, 12).map(function (item, index) {
+        return [
+          "<div class='yt-item'>",
+          "  <div style='min-width:0'>",
+          "    <div class='yt-title' title='" + escapeHtml(item.title) + "'>" + escapeHtml(item.title) + "</div>",
+          "    <div class='yt-meta'>" + escapeHtml(item.typeLabel + " / " + item.statusLabel) + "</div>",
+          "  </div>",
+          (item.action || item.url) ? "  <button type='button' data-chapter-index='" + index + "'>进入</button>" : "",
+          "</div>"
+        ].join("");
+      }).join("") : "<div class='yt-meta'>尚未扫描到章节</div>");
+      return;
+    }
+    if (name === "myTraining") {
+      container.innerHTML = queueMeta + (state.courseItems.length ? state.courseItems.slice(0, 12).map(function (item) {
+        return [
+          "<div class='yt-item'>",
+          "  <div style='min-width:0'>",
+          "    <div class='yt-title' title='" + escapeHtml(item.title) + "'>" + escapeHtml(item.title) + "</div>",
+          "    <div class='yt-meta'>进度 " + escapeHtml(item.progressText || "") + "</div>",
+          "  </div>",
+          "</div>"
+        ].join("");
+      }).join("") : "<div class='yt-meta'>尚未扫描到已选课程</div>");
+      return;
+    }
+    container.innerHTML = queueMeta + "<div class='yt-meta'>当前页：" + escapeHtml(location.pathname) + "</div>";
+  }
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, function (char) {
+      return {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+      }[char];
+    });
+  }
+
+  function manualScanCurrentPage() {
+    if (!ensureLoggedIn()) return;
+    var name = routeName();
+    if (name === "selectCourse") {
+      setStatus(STATUS.scanning, "正在扫描课程");
+      collectCourseQueueFromSelectPage(readConfig(), true).then(function () {
+        goToQueuedCourse("手动扫描完成");
+      }).catch(function (error) {
+        handleRecoverableError(error, "无法扫描课程队列");
+      });
+      return;
+    }
+    if (name === "courseAbout") {
+      var goLearn = findGoLearnButton();
+      if (goLearn) clickElement(goLearn, "进入学习");
+      else pause("当前课程介绍页未找到去学习按钮");
+      return;
+    }
+    if (name === "myTraining") {
+      handleMyTrainingPage(readConfig());
+      return;
+    }
+    if (name === "studyContent") {
+      setStatus(STATUS.scanning, "正在扫描章节");
+      var chapters = scanChapters();
+      state.chapterItems = chapters;
+      renderPanel();
+      var next = findNextPlayableChapter(chapters);
+      if (next) enterChapter(next, "进入未完成视频 " + next.title);
+      else completeCurrentCourse("当前课程没有未完成视频章节");
+      return;
+    }
+    if (name === "video") {
+      setStatus(STATUS.playing, "正在接管视频播放");
+      handleVideoPage();
+      return;
+    }
+    setStatus(STATUS.idle, "当前页面不在自动流程范围内");
+  }
+
+  function runRouter() {
+    initPanel();
+    if (!ensureLoggedIn()) return;
+    if (shouldWaitForNavigation()) return;
+
+    var config = readConfig();
+    if (config.paused) {
+      setStatus(STATUS.paused, "自动模式已暂停");
+      return;
+    }
+    if (!config.autoStart) {
+      setStatus(STATUS.idle, "自动模式未开启");
+      return;
+    }
+
+    var name = routeName();
+    var key = currentRouteKey();
+    if (state.running && state.routeRunKey === key) return;
+    if (state.completedRouteKey === key && name !== "video") return;
+    if (state.routeRunKey !== key) {
+      clearManagedAsync();
+      state.routeRunKey = key;
+    }
+    state.running = true;
+
+    var task = null;
+    if (name === "courseAbout" || name === "studyContent" || name === "video") {
+      syncQueueIndexToCurrentPage();
+    }
+    if (name === "selectCourse") {
+      task = handleSelectCoursePage(config);
+    } else if (name === "myTraining") {
+      task = handleMyTrainingPage(config);
+    } else if (name === "courseAbout") {
+      task = handleCourseAboutPage(config);
+    } else if (name === "studyContent") {
+      task = handleStudyContentPage(config);
+    } else if (name === "video") {
+      task = handleVideoPage(config);
+    } else {
+      setStatus(STATUS.idle, "等待进入课程相关页面");
+      state.running = false;
+      state.completedRouteKey = key;
+      return;
+    }
+
+    Promise.resolve(task).then(function () {
+      if (state.routeRunKey !== key) return;
+      if (name !== "video") state.completedRouteKey = key;
+    }).catch(function (error) {
+      if (state.routeRunKey === key) {
+        state.completedRouteKey = "";
+        handleRecoverableError(error, "路由执行失败");
+      }
+    }).finally(function () {
+      if (state.routeRunKey === key && name !== "video") state.running = false;
+    });
+  }
+
+  function handleSelectCoursePage(config) {
+    var queue = readQueue();
+    state.queueItems = queue.items;
+    if (queue.phase === "learning") {
+      var trainingUrl = queue.myTrainingUrl || buildMyTrainingUrl();
+      if (trainingUrl) {
+        navigateTo(trainingUrl, "学习阶段返回培训进度页");
+        return Promise.resolve();
+      }
+    }
+    if (queue.items.length && queue.index < queue.items.length) {
+      goToQueuedCourse("继续课程队列");
+      return Promise.resolve();
+    }
+    if (queue.items.length && queue.index >= queue.items.length) {
+      if (queue.phase === "selecting") finishSelectionPhase("全部课程已选课");
+      else setStatus(STATUS.complete, "课程队列已完成，请重置队列后重新开始");
+      return Promise.resolve();
+    }
+
+    setStatus(STATUS.scanning, "首次扫描全部课程分页");
+    return collectCourseQueueFromSelectPage(config, false).then(function (items) {
+      if (isPaused()) return;
+      if (!items.length) {
+        pause(config.targetCourseName ? "未找到指定课程：" + config.targetCourseName : "课程列表无可用课程");
+        return;
+      }
+      goToQueuedCourse("课程队列已建立");
+    });
+  }
+
+  async function collectCourseQueueFromSelectPage(config, forceReset) {
+    await retryWait(function () {
+      return scanCourses().length ? true : null;
+    }, "课程列表", config.maxRetries);
+
+    if (forceReset) writeQueue([], 0, "");
+    await goToFirstSelectCoursePage();
+
+    var all = [];
+    var seen = new Set();
+    var maxPages = 30;
+    for (var page = 0; page < maxPages; page += 1) {
+      if (isPaused()) throw new Error("自动流程已暂停");
+      await retryWait(function () {
+        return scanCourses().length ? true : null;
+      }, "课程列表", config.maxRetries);
+
+      var courses = scanCourses().filter(function (item) {
+        return courseMatchesTarget(item, config);
+      });
+      courses.forEach(function (item) {
+        var key = item.sign || item.selectUrl || item.title;
+        if (!key || seen.has(key)) return;
+        seen.add(key);
+        all.push(stripCourseQueueItem(item));
+      });
+      state.courseItems = all;
+      renderPanel();
+      log("已扫描课程 " + all.length + " 门");
+
+      var next = findSelectCourseNextPageButton();
+      if (!next) break;
+      var before = selectCoursePageSignature();
+      clickElement(next, "扫描课程下一页");
+      await waitFor(function () {
+        return selectCoursePageSignature() !== before && scanCourses().length;
+      }, { timeout: 12000, label: "下一页课程" }).catch(function () {
+        return delay(1200);
+      });
+    }
+
+    writeQueue(all, 0, location.pathname + location.search, {
+      phase: "selecting",
+      myTrainingUrl: buildMyTrainingUrl()
+    });
+    state.courseItems = all;
+    renderPanel();
+    return all;
+  }
+
+  function stripCourseQueueItem(item) {
+    return {
+      title: item.title,
+      name: item.name || item.title,
+      sign: item.sign || "",
+      classroomId: item.classroomId || "",
+      courseId: item.courseId || "",
+      trainClassId: item.trainClassId || getTrainClassId(),
+      selectUrl: item.selectUrl || "",
+      studyUrl: item.studyUrl || ""
+    };
+  }
+
+  async function goToFirstSelectCoursePage() {
+    var active = document.querySelector(".el-pager li.active");
+    if (active && textOf(active) === "1") return;
+    var first = Array.from(document.querySelectorAll(".el-pager li")).find(function (node) {
+      return isVisible(node) && textOf(node) === "1";
+    });
+    if (!first) return;
+    var before = selectCoursePageSignature();
+    clickElement(first, "返回课程第一页");
+    await waitFor(function () {
+      return selectCoursePageSignature() !== before && scanCourses().length;
+    }, { timeout: 12000, label: "课程第一页" }).catch(function () {
+      return delay(1200);
+    });
+  }
+
+  function selectCoursePageSignature() {
+    var wrap = document.querySelector(".select-course-wrap");
+    var vm = wrap && wrap.__vue__;
+    var page = vm && vm.$data && vm.$data.search ? vm.$data.search.page : "";
+    return String(page) + "|" + scanCourses().map(function (item) { return item.title; }).join("||");
+  }
+
+  function findSelectCourseNextPageButton() {
+    var buttons = Array.from(document.querySelectorAll(".el-pagination .btn-next, button.btn-next, button"));
+    return buttons.find(function (button) {
+      var text = textOf(button);
+      var cls = String(button.className || "");
+      var disabled = button.disabled || button.getAttribute("aria-disabled") === "true" || /disabled|is-disabled/.test(cls);
+      return isVisible(button) && !disabled && (/下一页/.test(text) || /btn-next/.test(cls));
+    }) || null;
+  }
+
+  function scanCourses() {
+    var vueItems = scanCoursesFromVue();
+    if (vueItems.length) return vueItems;
+
+    var actionText = /选课|去学习|开始学习|继续学习|进入学习|学习/;
+    var disabledText = /不可选|已结束|未开始|禁用|disabled/i;
+    var buttons = Array.from(document.querySelectorAll("button,a,[role='button']"))
+      .filter(isVisible)
+      .filter(function (node) {
+        var text = textOf(node);
+        var disabled = node.disabled || node.getAttribute("aria-disabled") === "true" || disabledText.test(text);
+        return !disabled && actionText.test(text);
+      });
+
+    var buttonItems = buttons.map(function (button) {
+      var card = closestUsefulContainer(button);
+      var title = extractCourseTitle(card, button);
+      return {
+        title: title,
+        action: button,
+        element: card || button
+      };
+    }).filter(function (item) {
+      return item.title && item.action;
+    });
+
+    var courseCards = Array.from(document.querySelectorAll(".course-card"));
+    if (!courseCards.length) courseCards = Array.from(document.querySelectorAll(".course-list > li"));
+    var cardItems = courseCards
+      .filter(isVisible)
+      .map(function (card) {
+        var text = textOf(card);
+        var title = extractCourseTitle(card, null);
+        if (!title || !/课程简介|学时|选课人数|已加入|开课时间/.test(text)) return null;
+        return {
+          title: title,
+          action: findCourseAction(card) || card,
+          element: card
+        };
+      })
+      .filter(Boolean);
+
+    return uniqueByElement(buttonItems.concat(cardItems));
+  }
+
+  function scanCoursesFromVue() {
+    var wrap = document.querySelector(".select-course-wrap");
+    var vm = wrap && wrap.__vue__;
+    var list = vm && vm.$data && Array.isArray(vm.$data.courseList) ? vm.$data.courseList : [];
+    var trainClassId = getTrainClassId();
+    return list.map(function (course, index) {
+      var name = course.name || course.course_name || course.title || "";
+      var sign = course.sign || course.course_sign || "";
+      var classroomId = Array.isArray(course.classroom_id) ? course.classroom_id[0] : course.classroom_id;
+      if (!name || !sign) return null;
+      var item = {
+        title: name,
+        name: name,
+        sign: sign,
+        classroomId: classroomId || "",
+        courseId: course.course_id || "",
+        trainClassId: trainClassId,
+        selectUrl: buildCourseAboutUrl(sign, trainClassId),
+        studyUrl: classroomId ? buildStudyContentUrlFor(sign, classroomId) : "",
+        action: findCourseCardByTitle(name) || document.querySelectorAll(".course-card")[index] || wrap,
+        element: findCourseCardByTitle(name) || document.querySelectorAll(".course-card")[index] || wrap
+      };
+      return item;
+    }).filter(Boolean);
+  }
+
+  function getTrainClassId() {
+    var fromUrl = new URLSearchParams(location.search).get("train_class_id");
+    if (fromUrl) return fromUrl;
+    var myTrainingMatch = location.pathname.match(/\/mytraining\/detail\/(\d+)/);
+    if (myTrainingMatch) return myTrainingMatch[1];
+    var pathMatch = location.pathname.match(/\/selectcourse\/(\d+)/);
+    if (pathMatch) return pathMatch[1];
+    var wrap = document.querySelector(".select-course-wrap");
+    var vm = wrap && wrap.__vue__;
+    var search = vm && vm.$data && vm.$data.search;
+    return search && search.train_class_id ? String(search.train_class_id) : "";
+  }
+
+  function buildMyTrainingUrl() {
+    var id = getTrainClassId();
+    return id ? location.origin + "/pro/trainingproject/mytraining/detail/" + encodeURIComponent(id) : "";
+  }
+
+  function buildCourseAboutUrl(sign, trainClassId) {
+    var url = location.origin + "/pro/portal/about/" + encodeURIComponent(sign);
+    if (trainClassId) url += "?train_class_id=" + encodeURIComponent(trainClassId);
+    return url;
+  }
+
+  function buildStudyContentUrlFor(sign, classroomId) {
+    return location.origin + "/pro/lms/" + encodeURIComponent(sign) + "/" + encodeURIComponent(classroomId) + "/studycontent";
+  }
+
+  function findCourseCardByTitle(title) {
+    return Array.from(document.querySelectorAll(".course-card")).find(function (card) {
+      return textOf(card.querySelector(".card-title")) === title || textOf(card).indexOf(title) >= 0;
+    }) || null;
+  }
+
+  function findCourseAction(card) {
+    return Array.from(card.querySelectorAll("button,a,[role='button'],[class*='btn' i]"))
+      .filter(isVisible)
+      .find(function (node) {
+        var text = textOf(node);
+        var disabled = node.disabled || node.getAttribute("aria-disabled") === "true" || /disabled|is-disabled/.test(String(node.className));
+        return !disabled && /选课|去学习|开始学习|继续学习|进入学习|学习|查看详情/.test(text);
+      }) || null;
+  }
+
+  function closestUsefulContainer(element) {
+    var candidates = [
+      "[class*='card']",
+      "[class*='course']",
+      "[class*='item']",
+      "[class*='list'] > *",
+      "li",
+      "tr",
+      "article",
+      "section"
+    ];
+    for (var i = 0; i < candidates.length; i += 1) {
+      var found = element.closest(candidates[i]);
+      if (found && found !== document.body && textOf(found).length < 1200) return found;
+    }
+    return element.parentElement;
+  }
+
+  function extractCourseTitle(card, action) {
+    var directTitle = card ? card.querySelector(".card-title, [class*='course-title' i], h1, h2, h3") : null;
+    if (directTitle && textOf(directTitle)) return textOf(directTitle).slice(0, 120);
+    var nodes = card ? Array.from(card.querySelectorAll("h1,h2,h3,h4,[class*='title'],[class*='name'],span,div")) : [];
+    var actionText = action ? textOf(action) : "";
+    var candidates = nodes.map(textOf).filter(function (text) {
+      return text && text !== actionText && text.length <= 120 && !/选课|去学习|开始学习|继续学习|进入学习/.test(text);
+    });
+    if (candidates.length) {
+      candidates.sort(function (a, b) { return b.length - a.length; });
+      return candidates[0];
+    }
+    var fallback = textOf(card || action).replace(actionText, "").trim();
+    return fallback.slice(0, 120);
+  }
+
+  function handleCourseAboutPage(config) {
+    setStatus(STATUS.scanning, "等待课程操作按钮");
+    return retryWait(function () {
+      return findCoursePrimaryButton();
+    }, "课程操作按钮", config.maxRetries).then(function (button) {
+      if (isPaused()) return;
+      return handleCoursePrimaryButton(button, config);
+    });
+  }
+
+  function findGoLearnButton() {
+    return findCoursePrimaryButton(/去学习|开始学习|继续学习|进入学习/);
+  }
+
+  function findCoursePrimaryButton(pattern) {
+    var matcher = pattern || /去学习|开始学习|继续学习|进入学习|选课|报名|加入课程|加入学习/;
+    return Array.from(document.querySelectorAll("button,a,[role='button'],[class*='btn' i]"))
+      .filter(isVisible)
+      .find(function (node) {
+        var text = textOf(node);
+        var disabled = node.disabled || node.getAttribute("aria-disabled") === "true" || /disabled|is-disabled/.test(String(node.className));
+        return !disabled && text.length <= 30 && matcher.test(text);
+      }) || null;
+  }
+
+  function handleMyTrainingPage(config) {
+    var queue = readQueue();
+    writeQueue([], 0, queue.source, {
+      phase: "learning",
+      myTrainingUrl: location.href
+    });
+    setStatus(STATUS.scanning, "扫描已选课程进度");
+    return retryWait(function () {
+      var rows = scanMyTrainingRows();
+      return rows.length ? rows : null;
+    }, "已选课程表格", config.maxRetries).then(function (rows) {
+      if (isPaused()) return;
+      state.courseItems = rows;
+      renderPanel();
+      var next = rows.find(function (row) {
+        return !row.complete && row.action;
+      });
+      if (!next) {
+        setStatus(STATUS.complete, "已选课程全部完成");
+        return;
+      }
+      clickElement(next.action, "进入未完成课程 " + next.title + "（" + next.progressText + "）");
+    });
+  }
+
+  function scanMyTrainingRows() {
+    return Array.from(document.querySelectorAll("tr"))
+      .filter(isVisible)
+      .map(function (row) {
+        var button = Array.from(row.querySelectorAll("button,a,[role='button']")).find(function (node) {
+          return isVisible(node) && /去学习|继续学习|开始学习|进入学习/.test(textOf(node));
+        });
+        if (!button) return null;
+        var cells = Array.from(row.querySelectorAll("td"));
+        var title = cells[1] ? textOf(cells[1]) : "";
+        var progressText = cells[5] ? textOf(cells[5]) : "";
+        if (!title) {
+          var rowText = textOf(row);
+          title = rowText.replace(/^\d+\s*/, "").replace(/选修.*$/, "").trim();
+        }
+        if (!progressText) {
+          var match = textOf(row).match(/(\d+(?:\.\d+)?)\s*%|已完成/);
+          progressText = match ? match[0] : "";
+        }
+        return {
+          title: title,
+          progressText: progressText,
+          complete: isProgressDone(progressText),
+          action: button,
+          element: row
+        };
+      })
+      .filter(function (item) {
+        return item && item.title;
+      });
+  }
+
+  function isProgressDone(text) {
+    if (!text) return false;
+    if (/已完成/.test(text)) return true;
+    var percent = String(text).match(/(\d+(?:\.\d+)?)\s*%/);
+    return percent ? Number(percent[1]) >= 100 : false;
+  }
+
+  async function handleCoursePrimaryButton(button, config) {
+    var text = textOf(button);
+    var queue = readQueue();
+    if (/选课|报名|加入课程|加入学习/.test(text)) {
+      clickElement(button, "自动选课");
+      if (queue.phase === "selecting") {
+        var selectedButton = await retryWait(function () {
+          return findGoLearnButton() || null;
+        }, "选课完成状态", config.maxRetries).catch(function () {
+          return null;
+        });
+        if (!selectedButton) {
+          pause("选课后未确认成功，请手动检查");
+          return;
+        }
+        advanceQueue("选课完成，继续下一门");
+        return;
+      }
+      await delay(1500);
+      var learnButton = await retryWait(function () {
+        return findGoLearnButton() || null;
+      }, "去学习按钮", config.maxRetries).catch(function () {
+        return findCoursePrimaryButton();
+      });
+      if (!learnButton) {
+        pause("选课后未找到去学习按钮");
+        return;
+      }
+      clickElement(learnButton, "选课后进入学习");
+      return;
+    }
+
+    if (/去学习|开始学习|继续学习|进入学习/.test(text)) {
+      if (queue.phase === "selecting") {
+        advanceQueue("该课程已选，继续下一门");
+        return;
+      }
+      clickElement(button, "自动进入学习");
+      return;
+    }
+
+    var queueItem = currentQueueItem();
+    if (queueItem && queueItem.studyUrl) {
+      log("未识别按钮文案，使用队列学习页链接");
+      navigateTo(queueItem.studyUrl, "进入学习页");
+      return;
+    }
+    pause("课程详情页未找到可执行操作");
+  }
+
+  function chooseCourse(courses, config) {
+    if (!courses.length) return null;
+    if (config.targetCourseName) {
+      return courses.find(function (item) { return item.title === config.targetCourseName; }) || null;
+    }
+    return courses[0];
+  }
+
+  function handleStudyContentPage(config) {
+    setStatus(STATUS.scanning, "等待章节列表");
+    return retryWait(function () {
+      var chapters = scanChapters();
+      return chapters.length ? chapters : null;
+    }, "章节列表", config.maxRetries).then(function (chapters) {
+      if (isPaused()) return;
+      state.chapterItems = chapters;
+      renderPanel();
+      var next = findNextPlayableChapter(chapters);
+      if (next) {
+        enterChapter(next, "自动进入未完成视频 " + next.title);
+        return;
+      }
+      completeCurrentCourse("当前课程没有未完成视频章节");
+    });
+  }
+
+  function scanChapters() {
+    var vueChapters = scanChaptersFromVue();
+    if (vueChapters.length) return vueChapters;
+
+    var selectors = [
+      ".chapter-list",
+      ".chapter-list .leaf-detail",
+      ".chapter-list .content",
+      ".leaf-detail",
+      ".leaf-title",
+      "a[href*='/video/']",
+      "[data-type*='video' i]",
+      "[class*='video' i]",
+      "[class*='chapter' i]",
+      "[class*='lesson' i]",
+      "[class*='catalog' i] li",
+      "[class*='tree' i] li",
+      "[role='treeitem']",
+      "[role='listitem']"
+    ];
+    var nodes = Array.from(document.querySelectorAll(selectors.join(","))).filter(isVisible);
+    var items = nodes.map(function (node) {
+      var row = closestChapterContainer(node);
+      var hrefNode = row.querySelector("a[href*='/video/']") || (node.matches && node.matches("a[href*='/video/']") ? node : null);
+      var action = hrefNode || findChapterAction(row) || node;
+      var text = textOf(row);
+      var title = extractChapterTitle(row, text);
+      var type = detectChapterType(row, action, text);
+      var complete = isChapterComplete(row, text);
+      var locked = /未开放|不可学习|锁定|敬请期待/.test(text);
+      return {
+        title: title,
+        action: action,
+        element: row,
+        type: type,
+        typeLabel: type === "video" ? "视频" : "非视频",
+        complete: complete,
+        statusLabel: complete ? "已完成" : (locked ? "不可学习" : "未完成"),
+        locked: locked
+      };
+    }).filter(function (item) {
+      return item.title && item.action && item.element && item.type === "video";
+    });
+
+    return uniqueByElement(items);
+  }
+
+  function scanChaptersFromVue() {
+    var container = document.querySelector(".study-content__container");
+    var vm = container && container.__vue__;
+    var data = vm && vm.$data ? vm.$data : null;
+    var chapters = data && Array.isArray(data.chapter_list) ? data.chapter_list : [];
+    if (!data || !chapters.length) return [];
+
+    var sign = data.sign || currentCourseSign();
+    var classroomId = data.classroom_id || (location.pathname.match(/\/pro\/lms\/[^/]+\/([^/]+)\//) || [])[1] || "";
+    var schedules = data.leaf_schedules || {};
+    var items = [];
+
+    chapters.forEach(function (chapter) {
+      var leaves = Array.isArray(chapter.section_leaf_list) ? chapter.section_leaf_list : [];
+      leaves.forEach(function (leaf) {
+        if (!leaf || leaf.is_show === false || leaf.is_locked) return;
+        var type = Number(leaf.leaf_type);
+        if (type !== 0) return;
+        var progress = Number(schedules[leaf.id] || 0);
+        var title = leaf.name || chapter.name || ("视频 " + leaf.id);
+        var url = location.origin + "/pro/lms/" + encodeURIComponent(sign) + "/" + encodeURIComponent(classroomId) + "/video/" + encodeURIComponent(leaf.id);
+        items.push({
+          key: String(leaf.id),
+          title: title,
+          url: url,
+          action: null,
+          element: findChapterElementByTitle(title) || container,
+          type: "video",
+          typeLabel: "视频",
+          complete: progress >= 0.99,
+          progress: progress,
+          statusLabel: progress >= 0.99 ? "已完成" : Math.round(progress * 100) + "%",
+          locked: false
+        });
+      });
+    });
+
+    return uniqueByElement(items);
+  }
+
+  function findChapterElementByTitle(title) {
+    return Array.from(document.querySelectorAll(".chapter-list, .leaf-detail, .leaf-title, .common-chapter")).find(function (node) {
+      return textOf(node).indexOf(title) >= 0;
+    }) || null;
+  }
+
+  function closestChapterContainer(element) {
+    var selectors = [
+      ".chapter-list",
+      ".leaf-detail",
+      ".content",
+      "li",
+      "[role='treeitem']",
+      "[role='listitem']",
+      "[class*='chapter' i]",
+      "[class*='lesson' i]",
+      "[class*='catalog' i]",
+      "[class*='section' i]",
+      "tr"
+    ];
+    for (var i = 0; i < selectors.length; i += 1) {
+      var found = element.closest(selectors[i]);
+      if (found && found !== document.body && textOf(found).length < 1600) return found;
+    }
+    return element;
+  }
+
+  function findChapterAction(row) {
+    var yuketangLeaf = Array.from(row.querySelectorAll(".leaf-detail, .content, .leaf-title"))
+      .filter(isVisible)[0];
+    if (yuketangLeaf) return yuketangLeaf;
+    var preferred = Array.from(row.querySelectorAll("a,button,[role='button']")).filter(isVisible).find(function (node) {
+      return /学习|播放|进入|继续|开始|查看|视频|下一节/.test(textOf(node)) || (node.href && /\/video\//.test(node.href));
+    });
+    if (preferred) return preferred;
+    return row.matches && row.matches("a,button,[role='button']") ? row : row.querySelector("a,button,[role='button']");
+  }
+
+  function extractChapterTitle(row, text) {
+    var leafTitle = row.querySelector(".leaf-title");
+    if (leafTitle && textOf(leafTitle)) return textOf(leafTitle).slice(0, 140);
+    var titleNode = Array.from(row.querySelectorAll("[class*='title' i],[class*='name' i],h1,h2,h3,h4,span,div,a")).map(function (node) {
+      return textOf(node);
+    }).filter(function (candidate) {
+      return candidate && candidate.length <= 140 && !/已完成|未完成|学习|播放|进入|继续|开始|视频|文档|讨论|作业/.test(candidate);
+    }).sort(function (a, b) {
+      return b.length - a.length;
+    })[0];
+    if (titleNode) return titleNode;
+    return text.replace(/已完成|未完成|学习|播放|进入|继续|开始|视频|文档|讨论|作业|100%|\d+%/g, "").trim().slice(0, 140);
+  }
+
+  function detectChapterType(row, action, text) {
+    var href = action && action.href ? action.href : "";
+    var icon = row.querySelector(".leaf-detail i, .content i, i[class*='icon--'], i[class*='icon-']");
+    var iconClass = icon ? String(icon.className || "") : "";
+    var marker = [
+      row.getAttribute("data-type"),
+      row.getAttribute("data-resource-type"),
+      row.className,
+      iconClass,
+      href,
+      text
+    ].join(" ");
+    if (/shipin|video/i.test(iconClass)) return "video";
+    if (/tuwen|taolun|zuoye|kaoshi|kejian|ketang|yinpin|audio|wendang|doc/i.test(iconClass)) return "other";
+    if (/文档|资料|讨论|作业|考试|测验|quiz|homework|discussion|doc/i.test(marker)) return "other";
+    if (row.matches(".chapter-list, .leaf-detail") || row.querySelector(".leaf-title")) return "video";
+    if (/video|视频|\/video\//i.test(marker)) return "video";
+    return "other";
+  }
+
+  function isChapterComplete(row, text) {
+    var aria = row.getAttribute("aria-label") || "";
+    var marker = [text, aria, row.className].join(" ");
+    if (/未完成|未学习|待学习|继续学习|未开始/.test(marker)) return false;
+    var percent = marker.match(/(\d+(?:\.\d+)?)\s*%/);
+    if (percent) return Number(percent[1]) >= 100;
+    return /已完成|completed|finish/i.test(marker);
+  }
+
+  function findNextPlayableChapter(chapters) {
+    return chapters.find(function (item) {
+      return item.type === "video" && !item.complete && !item.locked && (item.action || item.url);
+    }) || null;
+  }
+
+  function handleVideoPage(config) {
+    config = config || readConfig();
+    state.handledEnd = false;
+    setStatus(STATUS.playing, "等待播放器");
+    return retryWait(function () {
+      return findVideoElement();
+    }, "播放器", config.maxRetries, 20000).then(function (video) {
+      if (isPaused()) return;
+      attachVideoAutomation(video, config);
+    });
+  }
+
+  function findVideoElement() {
+    var videos = Array.from(document.querySelectorAll("video")).filter(function (video) {
+      return isVisible(video) || video.readyState > 0 || video.duration;
+    });
+    if (videos.length) {
+      videos.sort(function (a, b) {
+        return (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight);
+      });
+      return videos[0];
+    }
+    return null;
+  }
+
+  function attachVideoAutomation(video, config) {
+    setStatus(STATUS.playing, "已接管播放器，目标倍速 " + config.playbackRate + "x");
+    setupVideoRate(video, config.playbackRate);
+
+    var onProgress = function () {
+      if (state.handledEnd || isPaused()) return;
+      setupVideoRate(video, config.playbackRate);
+      if (isVideoNearlyEnded(video)) {
+        state.handledEnd = true;
+        log("检测到播放进度达到 99%");
+        goNextAfterVideo();
+      }
+    };
+    var onEnded = function () {
+      if (state.handledEnd || isPaused()) return;
+      state.handledEnd = true;
+      log("检测到 ended 事件");
+      goNextAfterVideo();
+    };
+    var onError = function () {
+      if (isPaused()) return;
+      var maxRetries = readConfig().maxRetries;
+      state.videoRetryCount += 1;
+      if (state.videoRetryCount > maxRetries) {
+        pause("视频加载失败，请手动检查网络或播放器");
+        return;
+      }
+      setStatus(STATUS.playing, "视频加载失败，10 秒后重试 " + state.videoRetryCount + "/" + maxRetries);
+      schedule(function () {
+        try {
+          video.load();
+          playVideo(video);
+        } catch (error) {
+          console.warn(error);
+        }
+      }, 10000);
+    };
+
+    video.addEventListener("timeupdate", onProgress);
+    video.addEventListener("progress", onProgress);
+    video.addEventListener("durationchange", onProgress);
+    video.addEventListener("ended", onEnded);
+    video.addEventListener("error", onError);
+    state.observerDisposers.push(function () {
+      video.removeEventListener("timeupdate", onProgress);
+      video.removeEventListener("progress", onProgress);
+      video.removeEventListener("durationchange", onProgress);
+      video.removeEventListener("ended", onEnded);
+      video.removeEventListener("error", onError);
+    });
+
+    playVideo(video);
+  }
+
+  function setupVideoRate(video, targetRate) {
+    try {
+      video.playbackRate = targetRate;
+      if (Math.abs(video.playbackRate - targetRate) > 0.05) {
+        var fallback = Math.max(video.playbackRate || 1, 1);
+        video.playbackRate = fallback;
+        log("平台限制倍速，回退为 " + video.playbackRate + "x");
+      }
+    } catch (error) {
+      log("设置倍速失败：" + error.message);
+    }
+  }
+
+  function playVideo(video) {
+    try {
+      var promise = video.play();
+      if (promise && typeof promise.catch === "function") {
+        promise.catch(function (error) {
+          setStatus(STATUS.error, "浏览器阻止自动播放，请手动点一次播放");
+          log("自动播放被阻止：" + error.message);
+        });
+      }
+    } catch (error) {
+      setStatus(STATUS.error, "播放器启动失败，请手动点一次播放");
+      log("调用 play() 失败：" + error.message);
+    }
+  }
+
+  function isVideoNearlyEnded(video) {
+    if (!video || !Number.isFinite(video.duration) || video.duration <= 0) return false;
+    if (video.ended) return true;
+    var progress = video.currentTime / video.duration;
+    return progress >= 0.99 || video.duration - video.currentTime <= 1.5;
+  }
+
+  function goNextAfterVideo() {
+    setStatus(STATUS.scanning, "准备跳转下一节");
+    schedule(function () {
+      if (isPaused()) return;
+      var next = findNextButton();
+      if (next) {
+        next.dispatchEvent(new Event("mousemove", { bubbles: true }));
+        clickElement(next, "跳转下一节");
+        return;
+      }
+      var queue = readQueue();
+      if (queue.phase === "learning" && queue.myTrainingUrl) {
+        log("未找到下一节按钮，返回培训进度页重新调度");
+        delay(2500).then(function () {
+          completeCurrentCourse("当前视频完成");
+        });
+        return;
+      }
+      var studyUrl = buildStudyContentUrl();
+      if (studyUrl) {
+        log("未找到下一节按钮，返回学习内容页重新扫描");
+        navigateTo(studyUrl, "返回学习内容页重新扫描");
+        return;
+      }
+      pause("无法确定下一节或学习内容页地址");
+    }, 1200);
+  }
+
+  function findNextButton() {
+    var candidates = Array.from(document.querySelectorAll("button,a,[role='button'],.btn-next,.header-bar .pointer,.header-bar span"))
+      .filter(isVisible)
+      .filter(function (node) {
+        var text = textOf(node);
+        var disabled = node.disabled || node.getAttribute("aria-disabled") === "true" || /disabled|disable/.test(String(node.className));
+        return !disabled && text.length <= 30 && /下一单元|下一节|下一个|下一课|继续学习/.test(text);
+      });
+    candidates.sort(function (a, b) {
+      var aScore = /btn-next/.test(String(a.className)) ? 0 : 1;
+      var bScore = /btn-next/.test(String(b.className)) ? 0 : 1;
+      return aScore - bScore;
+    });
+    return candidates[0] || null;
+  }
+
+  function buildStudyContentUrl() {
+    var match = location.pathname.match(/^(\/pro\/lms\/[^/]+\/[^/]+)\/video\//);
+    if (!match) return "";
+    return location.origin + match[1] + "/studycontent" + location.search;
+  }
+
+  function retryWait(factory, label, maxRetries, timeout) {
+    var attempt = 0;
+    var limit = Math.max(0, Number(maxRetries) || 0);
+
+    function runAttempt() {
+      attempt += 1;
+      return waitFor(factory, {
+        timeout: timeout || 15000,
+        label: label
+      }).catch(function (error) {
+        if (isPaused()) throw error;
+        if (attempt <= limit) {
+          log("等待" + label + "失败，重试 " + attempt + "/" + limit + "：" + error.message);
+          return new Promise(function (resolve) {
+            schedule(resolve, 1000);
+          }).then(runAttempt);
+        }
+        throw error;
+      });
+    }
+
+    return runAttempt();
+  }
+
+  function handleRecoverableError(error, fallbackMessage) {
+    var config = readConfig();
+    log(fallbackMessage + "：" + error.message);
+    if (config.continueOnError && routeName() === "video") {
+      var studyUrl = buildStudyContentUrl();
+      if (studyUrl) {
+        setStatus(STATUS.scanning, "出错，返回学习内容页重扫");
+        schedule(function () { navigateTo(studyUrl, "视频页出错后返回学习内容页"); }, 1500);
+        return;
+      }
+    }
+    pause(fallbackMessage + "，请手动干预");
+  }
+
+  function installNavigationHooks() {
+    var originalPushState = history.pushState;
+    var originalReplaceState = history.replaceState;
+    history.pushState = function () {
+      var result = originalPushState.apply(this, arguments);
+      schedule(runRouter, 300);
+      return result;
+    };
+    history.replaceState = function () {
+      var result = originalReplaceState.apply(this, arguments);
+      schedule(runRouter, 300);
+      return result;
+    };
+    window.addEventListener("popstate", function () { schedule(runRouter, 300); });
+    window.addEventListener("hashchange", function () { schedule(runRouter, 300); });
+  }
+
+  initPanel();
+  installNavigationHooks();
+  schedule(runRouter, 300);
+})();
