@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.5.4
+// @version      0.5.5
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
 // @match        https://kmustyjscfd.yuketang.cn/pro/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
@@ -2148,6 +2148,57 @@
     refreshCurrentPage(fallbackMessage);
   }
 
+  // 防切屏：浏览器不允许用代码把后台标签页切到前台（window.focus() 对后台标签无效），
+  // 因此改为让页面始终被判定为“可见且有焦点”，从而阻止雨课堂在标签页未聚焦时反复暂停视频。
+  function preventScreenCheck() {
+    var win = getPageWindow();
+    var docs = [];
+    [(win && win.document) || null, document].forEach(function (d) {
+      if (d && docs.indexOf(d) < 0) docs.push(d);
+    });
+    var blocked = ["visibilitychange", "webkitvisibilitychange", "mozvisibilitychange", "blur", "pagehide"];
+
+    function defineVisible(obj, prop, getter) {
+      try {
+        Object.defineProperty(obj, prop, { configurable: true, get: getter });
+      } catch (error) { /* 某些环境下不可重定义，忽略 */ }
+    }
+    docs.forEach(function (d) {
+      defineVisible(d, "hidden", function () { return false; });
+      defineVisible(d, "webkitHidden", function () { return false; });
+      defineVisible(d, "mozHidden", function () { return false; });
+      defineVisible(d, "visibilityState", function () { return "visible"; });
+      defineVisible(d, "webkitVisibilityState", function () { return "visible"; });
+      try { d.hasFocus = function () { return true; }; } catch (error) { /* ignore */ }
+    });
+
+    // 拦截“之后”注册的切屏/失焦监听（脚本早于播放器加载时最有效）。
+    function wrapAdd(target) {
+      if (!target || target.__ytAecWrapped) return;
+      var original = target.addEventListener;
+      if (typeof original !== "function") return;
+      target.__ytAecOrigAdd = original;
+      target.addEventListener = function (type) {
+        if (blocked.indexOf(String(type)) >= 0) return undefined;
+        return original.apply(this, arguments);
+      };
+      target.__ytAecWrapped = true;
+    }
+    [win].concat(docs).forEach(wrapAdd);
+
+    // 兜底：用原始 addEventListener 在捕获阶段吞掉这些事件，尽量拦住已注册的处理器。
+    function swallow(event) {
+      try { event.stopImmediatePropagation(); } catch (error) { /* ignore */ }
+    }
+    [win].concat(docs).forEach(function (target) {
+      if (!target) return;
+      var add = target.__ytAecOrigAdd || target.addEventListener;
+      blocked.forEach(function (type) {
+        try { add.call(target, type, swallow, true); } catch (error) { /* ignore */ }
+      });
+    });
+  }
+
   function installNavigationHooks() {
     var originalPushState = history.pushState;
     var originalReplaceState = history.replaceState;
@@ -2165,7 +2216,17 @@
     window.addEventListener("hashchange", function () { schedule(runRouter, 300); });
   }
 
-  initPanel();
-  installNavigationHooks();
-  schedule(runRouter, 300);
+  // 立即执行防切屏（document-start 时机最早，能在播放器注册监听前生效）。
+  preventScreenCheck();
+
+  function bootstrap() {
+    initPanel();
+    installNavigationHooks();
+    schedule(runRouter, 300);
+  }
+  if (document.body) {
+    bootstrap();
+  } else {
+    document.addEventListener("DOMContentLoaded", bootstrap, { once: true });
+  }
 })();
