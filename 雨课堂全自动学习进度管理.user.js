@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.2.5
+// @version      0.2.6
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节。
 // @author       local
 // @license      GPL-3.0-only
@@ -1587,10 +1587,7 @@
   }
 
   function isVideoNearlyEnded(video) {
-    if (!video || !Number.isFinite(video.duration) || video.duration <= 0) return false;
-    if (video.ended) return true;
-    var remaining = video.duration - video.currentTime;
-    return remaining >= 0 && remaining <= 0.5;
+    return Boolean(video && video.ended);
   }
 
   function goNextAfterVideo() {
