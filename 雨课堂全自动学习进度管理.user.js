@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.5.0
+// @version      0.5.1
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
@@ -32,9 +32,10 @@
   var POST_HEARTBACK_SETTLE_MS = 1500;
   var PANEL_RENDER_THROTTLE_MS = 200;
   var WAIT_MUTATION_THROTTLE_MS = 250;
-  var VIDEO_WATCHDOG_INTERVAL_MS = 5000;
-  var VIDEO_STALL_TIMEOUT_MS = 30000;
+  var VIDEO_WATCHDOG_INTERVAL_MS = 4000;
+  var VIDEO_STALL_TIMEOUT_MS = 8000;
   var VIDEO_NEAR_END_SECONDS = 1.5;
+  var MAX_STALL_RECOVERIES = 4;
   var MAX_TRAINING_REVISITS = 3;
   var CONFIG_KEYS = {
     playbackRate: "yt_auto.playbackRate",
@@ -468,7 +469,7 @@
     var count = 0;
     try { count = Number(window.sessionStorage.getItem(key) || 0) || 0; } catch (error) { count = 0; }
     try { window.sessionStorage.setItem(key, String(count + 1)); } catch (error) { /* ignore */ }
-    var delayMs = count < 3 ? 2000 : (count < 6 ? 15000 : 60000);
+    var delayMs = count < 4 ? 3000 : (count < 8 ? 8000 : 20000);
     setStatus(STATUS.error, reason + "，" + Math.round(delayMs / 1000) + " 秒后刷新本页重试（第 " + (count + 1) + " 次，自动模式保持开启）");
     schedule(function () {
       if (!isPaused()) location.reload();
@@ -1634,7 +1635,7 @@
       var mediaError = video.error ? ("错误码 " + video.error.code) : "未知错误";
       if (state.videoRetryCount <= maxRetries) {
         // 先就地重载，处理瞬时网络抖动。
-        setStatus(STATUS.playing, "视频加载失败（" + mediaError + "），5 秒后重试 " + state.videoRetryCount + "/" + maxRetries);
+        setStatus(STATUS.playing, "视频加载失败（" + mediaError + "），3 秒后重试 " + state.videoRetryCount + "/" + maxRetries);
         schedule(function () {
           if (isPaused() || state.handledEnd) return;
           try {
@@ -1644,7 +1645,7 @@
           } catch (error) {
             console.warn(error);
           }
-        }, 5000);
+        }, 3000);
         return;
       }
       // 就地重载无效，多半是播放凭证过期：整页刷新换取新的视频地址，而不是反复加载同一个失效链接。
@@ -1725,7 +1726,7 @@
     if (!video) return function () {};
     var lastTime = -1;
     var lastAdvanceAt = Date.now();
-    var stallCount = 0;
+    var recoverAttempts = 0;
     var nudgeCount = 0;
 
     var timer = window.setInterval(function () {
@@ -1738,15 +1739,16 @@
       var now = Date.now();
       var current = Number(video.currentTime) || 0;
       var duration = Number(video.duration) || 0;
-      if (Math.abs(current - lastTime) > 0.25) {
+      // 只有在“正在播放且进度确实推进”时才认为没卡；停在结尾(paused)时不会被 currentTime 抖动误判。
+      if (!video.paused && Math.abs(current - lastTime) > 0.25) {
         lastTime = current;
         lastAdvanceAt = now;
-        stallCount = 0;
+        recoverAttempts = 0;
         nudgeCount = 0;
         return;
       }
       if (now - lastAdvanceAt < VIDEO_STALL_TIMEOUT_MS) return;
-      lastAdvanceAt = now;
+      // 注意：这里不再重置 lastAdvanceAt，卡住后每个 tick 都会尝试恢复，而不是每 30 秒一次。
 
       if (duration > 0 && current >= duration - VIDEO_NEAR_END_SECONDS) {
         nudgeCount += 1;
@@ -1765,16 +1767,15 @@
         return;
       }
 
-      stallCount += 1;
-      var maxRetries = readConfig().maxRetries;
-      if (stallCount > 3 + maxRetries) {
-        // 卡死多半也是加载/凭证问题：刷新当前页重试，保持自动模式。
+      recoverAttempts += 1;
+      if (recoverAttempts > MAX_STALL_RECOVERIES) {
+        // 多次就地恢复无效，多半是加载/凭证问题：刷新当前页重试，保持自动模式。
         refreshCurrentPage("视频长时间无法继续播放");
         return;
       }
-      setStatus(STATUS.playing, "视频卡住，尝试恢复播放（" + stallCount + "）");
+      setStatus(STATUS.playing, "视频卡住，尝试恢复播放（" + recoverAttempts + "/" + MAX_STALL_RECOVERIES + "）");
       try {
-        if (stallCount > 3) {
+        if (recoverAttempts >= 2) {
           video.load();
           setupYuketangPlayer(readConfig().playbackRate);
         }
