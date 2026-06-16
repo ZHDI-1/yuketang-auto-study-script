@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.2.1
+// @version      0.2.2
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节。
 // @author       local
 // @license      MIT
@@ -1428,6 +1428,15 @@
       log("检测到 ended 事件");
       goNextAfterVideo();
     };
+    var onPause = function () {
+      if (state.handledEnd || isPaused() || video.ended) return;
+      schedule(function () {
+        if (!state.handledEnd && !isPaused() && video.paused && !video.ended) {
+          log("检测到播放器暂停，自动恢复播放");
+          playVideo(video, 0);
+        }
+      }, 1000);
+    };
     var onError = function () {
       if (isPaused()) return;
       var maxRetries = readConfig().maxRetries;
@@ -1451,16 +1460,36 @@
     video.addEventListener("progress", onProgress);
     video.addEventListener("durationchange", onProgress);
     video.addEventListener("ended", onEnded);
+    video.addEventListener("pause", onPause);
     video.addEventListener("error", onError);
+    var pauseTipObserver = observePlayButtonTip(video);
     state.observerDisposers.push(function () {
       video.removeEventListener("timeupdate", onProgress);
       video.removeEventListener("progress", onProgress);
       video.removeEventListener("durationchange", onProgress);
       video.removeEventListener("ended", onEnded);
+      video.removeEventListener("pause", onPause);
       video.removeEventListener("error", onError);
+      if (pauseTipObserver) pauseTipObserver();
     });
 
     playVideo(video, 0);
+  }
+
+  function observePlayButtonTip(video) {
+    var tip = document.getElementsByClassName("play-btn-tip")[0];
+    if (!tip) return null;
+    var observer = new MutationObserver(function () {
+      if (state.handledEnd || isPaused() || video.ended) return;
+      if (textOf(tip) === "播放") {
+        log("播放器显示播放状态，自动恢复");
+        playVideo(video, 0);
+      }
+    });
+    observer.observe(tip, { childList: true, subtree: true, characterData: true });
+    return function () {
+      observer.disconnect();
+    };
   }
 
   function prepareVideoForAutoplay(video) {
@@ -1477,8 +1506,53 @@
     }
   }
 
+  function applyYuketangPlayerOptions(video, targetRate) {
+    prepareVideoForAutoplay(video);
+    applyXtPlayerVueOptions(targetRate);
+    applyXtSpeedControl(targetRate);
+  }
+
+  function applyXtPlayerVueOptions(targetRate) {
+    var xtplayer = document.querySelector(".xtplayer");
+    var vm = xtplayer && xtplayer.__vue__;
+    var player = vm && vm.player;
+    if (!player || !player.options) return false;
+    try {
+      if (player.options.speed) player.options.speed.value = Number(targetRate);
+      if (player.options.volume) player.options.volume.value = 0;
+      return true;
+    } catch (error) {
+      log("同步雨课堂播放器参数失败：" + error.message);
+      return false;
+    }
+  }
+
+  function applyXtSpeedControl(targetRate) {
+    var speedButton = document.querySelector("xt-speedlist xt-button") || (document.getElementsByTagName("xt-speedlist")[0] && document.getElementsByTagName("xt-speedlist")[0].firstElementChild && document.getElementsByTagName("xt-speedlist")[0].firstElementChild.firstElementChild);
+    var speedWrap = document.getElementsByTagName("xt-speedbutton")[0];
+    if (!speedButton || !speedWrap) return false;
+    try {
+      speedButton.setAttribute("data-speed", String(targetRate));
+      speedButton.setAttribute("keyt", Number(targetRate).toFixed(2));
+      speedButton.textContent = Number(targetRate).toFixed(2) + "X";
+      speedWrap.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, view: window }));
+      speedButton.click();
+      return true;
+    } catch (error) {
+      log("同步雨课堂倍速控件失败：" + error.message);
+      return false;
+    }
+  }
+
   function setupVideoRate(video, targetRate) {
     try {
+      var appliedRate = video.getAttribute("data-yt-auto-applied-rate");
+      if (appliedRate !== String(targetRate)) {
+        applyYuketangPlayerOptions(video, targetRate);
+        video.setAttribute("data-yt-auto-applied-rate", String(targetRate));
+      } else {
+        prepareVideoForAutoplay(video);
+      }
       video.playbackRate = targetRate;
       if (Math.abs(video.playbackRate - targetRate) > 0.05) {
         var fallback = Math.max(video.playbackRate || 1, 1);
