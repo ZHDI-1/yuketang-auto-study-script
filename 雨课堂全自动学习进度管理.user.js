@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.2.3
+// @version      0.2.4
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节。
 // @author       local
-// @license      MIT
+// @license      GPL-3.0-only
 // @match        https://kmustyjscfd.yuketang.cn/pro/*
 // @run-at       document-idle
 // @grant        GM_getValue
@@ -19,6 +19,9 @@
    * 本脚本仅供个人学习效率提升，所有操作均基于用户合法授权及浏览器已登录状态。
    * 不篡改学习数据，不绕过平台验证码或安全机制。
    * 使用者应遵守雨课堂服务条款，因违规使用产生的后果自负。
+   *
+   * 播放器控制逻辑参考本地 yuketang.js「雨课堂刷课助手」的 Player 工具实现。
+   * 原脚本许可证为 GPL3，因此本脚本以 GPL-3.0-only 发布。
    */
 
   var SCRIPT_NAME = "雨课堂自动学习";
@@ -79,9 +82,7 @@
     completedRouteKey: "",
     navigatingTo: "",
     navigationStartedAt: 0,
-    lastUserGestureAt: 0,
-    lastResumeAttemptAt: 0,
-    resumeAttemptCount: 0
+    lastUserGestureAt: 0
   };
 
   function readConfig() {
@@ -1412,14 +1413,11 @@
 
   function attachVideoAutomation(video, config) {
     setStatus(STATUS.playing, "已接管播放器，目标倍速 " + config.playbackRate + "x");
-    state.lastResumeAttemptAt = 0;
-    state.resumeAttemptCount = 0;
-    prepareVideoForAutoplay(video);
-    setupVideoRate(video, config.playbackRate);
+    applyYuketangPlayerDefaults(video, config.playbackRate);
 
     var onProgress = function () {
       if (state.handledEnd || isPaused()) return;
-      setupVideoRate(video, config.playbackRate);
+      applyYuketangMediaDefaults(video, config.playbackRate);
       if (isVideoNearlyEnded(video)) {
         state.handledEnd = true;
         log("检测到播放进度达到 99%");
@@ -1431,14 +1429,6 @@
       state.handledEnd = true;
       log("检测到 ended 事件");
       goNextAfterVideo();
-    };
-    var onPause = function () {
-      if (state.handledEnd || isPaused() || video.ended) return;
-      schedule(function () {
-        if (!state.handledEnd && !isPaused() && video.paused && !video.ended) {
-          requestResumePlayback(video, "检测到播放器暂停");
-        }
-      }, 1000);
     };
     var onError = function () {
       if (isPaused()) return;
@@ -1452,7 +1442,7 @@
       schedule(function () {
         try {
           video.load();
-          playVideo(video, 0);
+          playYuketangVideo(video);
         } catch (error) {
           console.warn(error);
         }
@@ -1463,21 +1453,23 @@
     video.addEventListener("progress", onProgress);
     video.addEventListener("durationchange", onProgress);
     video.addEventListener("ended", onEnded);
-    video.addEventListener("pause", onPause);
     video.addEventListener("error", onError);
+    var stopObservePause = observeYuketangPause(video);
     state.observerDisposers.push(function () {
       video.removeEventListener("timeupdate", onProgress);
       video.removeEventListener("progress", onProgress);
       video.removeEventListener("durationchange", onProgress);
       video.removeEventListener("ended", onEnded);
-      video.removeEventListener("pause", onPause);
       video.removeEventListener("error", onError);
+      if (stopObservePause) stopObservePause();
     });
 
-    playVideo(video, 0);
+    if (!stopObservePause) {
+      playYuketangVideo(video);
+    }
   }
 
-  function prepareVideoForAutoplay(video) {
+  function applyYuketangMediaDefaults(video, targetRate) {
     if (!video) return;
     try {
       video.muted = true;
@@ -1486,42 +1478,41 @@
       video.setAttribute("muted", "muted");
       video.setAttribute("playsinline", "playsinline");
       video.setAttribute("webkit-playsinline", "webkit-playsinline");
+      video.playbackRate = targetRate;
     } catch (error) {
-      log("设置静音自动播放参数失败：" + error.message);
+      log("设置播放器默认参数失败：" + error.message);
     }
   }
 
-  function applyYuketangPlayerOptions(video, targetRate) {
-    prepareVideoForAutoplay(video);
-    applyXtPlayerVueOptions(targetRate);
-    applyXtSpeedControl(targetRate);
+  function applyYuketangPlayerDefaults(video, targetRate) {
+    applyYuketangSpeed(targetRate);
+    muteYuketangPlayer(video);
+    applyYuketangMediaDefaults(video, targetRate);
   }
 
-  function applyXtPlayerVueOptions(targetRate) {
-    var xtplayer = document.querySelector(".xtplayer");
-    var vm = xtplayer && xtplayer.__vue__;
-    var player = vm && vm.player;
-    if (!player || !player.options) return false;
-    try {
-      if (player.options.speed) player.options.speed.value = Number(targetRate);
-      if (player.options.volume) player.options.volume.value = 0;
-      return true;
-    } catch (error) {
-      log("同步雨课堂播放器参数失败：" + error.message);
+  function applyYuketangSpeed(targetRate) {
+    var speedKey = Number(targetRate).toFixed(2);
+    var speedButton = document.querySelector("xt-speedlist [data-speed='" + String(Number(targetRate)) + "']")
+      || document.querySelector("xt-speedlist [keyt='" + speedKey + "']")
+      || document.querySelector("xt-speedlist xt-button")
+      || (document.getElementsByTagName("xt-speedlist")[0] && document.getElementsByTagName("xt-speedlist")[0].firstElementChild && document.getElementsByTagName("xt-speedlist")[0].firstElementChild.firstElementChild);
+    var speedWrap = document.getElementsByTagName("xt-speedbutton")[0];
+    var video = document.querySelector("video");
+    if (!speedButton || !speedWrap) {
+      if (video) video.playbackRate = targetRate;
       return false;
     }
-  }
-
-  function applyXtSpeedControl(targetRate) {
-    var speedButton = document.querySelector("xt-speedlist xt-button") || (document.getElementsByTagName("xt-speedlist")[0] && document.getElementsByTagName("xt-speedlist")[0].firstElementChild && document.getElementsByTagName("xt-speedlist")[0].firstElementChild.firstElementChild);
-    var speedWrap = document.getElementsByTagName("xt-speedbutton")[0];
-    if (!speedButton || !speedWrap) return false;
     try {
       speedButton.setAttribute("data-speed", String(targetRate));
-      speedButton.setAttribute("keyt", Number(targetRate).toFixed(2));
-      speedButton.textContent = Number(targetRate).toFixed(2) + "X";
-      speedWrap.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, view: window }));
+      speedButton.setAttribute("keyt", speedKey);
+      speedButton.textContent = speedKey + "X";
+      var mousemove = document.createEvent("MouseEvent");
+      mousemove.initMouseEvent("mousemove", true, true, window, 0, 10, 10, 10, 10, 0, 0, 0, 0, 0, null);
+      speedWrap.dispatchEvent(mousemove);
       speedButton.click();
+      var speedValue = speedWrap.querySelector("xt-speedvalue");
+      if (speedValue) speedValue.textContent = speedKey + "X";
+      if (video) video.playbackRate = targetRate;
       return true;
     } catch (error) {
       log("同步雨课堂倍速控件失败：" + error.message);
@@ -1529,73 +1520,59 @@
     }
   }
 
-  function setupVideoRate(video, targetRate) {
+  function muteYuketangPlayer(video) {
     try {
-      var appliedRate = video.getAttribute("data-yt-auto-applied-rate");
-      if (appliedRate !== String(targetRate)) {
-        applyYuketangPlayerOptions(video, targetRate);
-        video.setAttribute("data-yt-auto-applied-rate", String(targetRate));
-      } else {
-        prepareVideoForAutoplay(video);
+      var muteButton = document.querySelector("#video-box > div > xt-wrap > xt-controls > xt-inner > xt-volumebutton > xt-icon");
+      if (muteButton) {
+        muteButton.click();
       }
-      video.playbackRate = targetRate;
-      if (Math.abs(video.playbackRate - targetRate) > 0.05) {
-        var fallback = Math.max(video.playbackRate || 1, 1);
-        video.playbackRate = fallback;
-        log("平台限制倍速，回退为 " + video.playbackRate + "x");
-      }
+      applyYuketangMediaDefaults(video || document.querySelector("video"), readConfig().playbackRate);
     } catch (error) {
-      log("设置倍速失败：" + error.message);
+      log("设置静音失败：" + error.message);
     }
   }
 
-  function playVideo(video, attempt) {
-    attempt = Number(attempt) || 0;
+  function playYuketangVideo(video) {
     if (!video || isPaused()) return;
-    prepareVideoForAutoplay(video);
+    applyYuketangMediaDefaults(video, readConfig().playbackRate);
     try {
       var promise = video.play();
       if (promise && typeof promise.catch === "function") {
         promise.catch(function (error) {
-          handlePlayBlocked(video, error, attempt);
+          console.warn("自动播放失败:", error);
+          schedule(function () {
+            if (!isPaused() && !state.handledEnd && !video.ended && video.paused) {
+              playYuketangVideo(video);
+            }
+          }, 3000);
         });
       }
     } catch (error) {
-      handlePlayBlocked(video, error, attempt);
+      console.warn("自动播放失败:", error);
+      schedule(function () {
+        if (!isPaused() && !state.handledEnd && !video.ended && video.paused) {
+          playYuketangVideo(video);
+        }
+      }, 3000);
     }
   }
 
-  function handlePlayBlocked(video, error, attempt) {
-    if (isPaused()) return;
-    var maxAttempts = 6;
-    log("自动播放被阻止，静音重试 " + (attempt + 1) + "/" + maxAttempts + "：" + (error && error.message ? error.message : "unknown"));
-    prepareVideoForAutoplay(video);
-    if (attempt + 1 >= maxAttempts) {
-      setStatus(STATUS.error, "自动播放暂不可用，等待下一次恢复窗口");
-      requestResumePlayback(video, "自动播放被阻止");
-      return;
-    }
-    schedule(function () {
-      if (!isPaused() && video.paused) playVideo(video, attempt + 1);
-    }, attempt < 2 ? 700 : 1800);
-  }
-
-  function requestResumePlayback(video, reason) {
-    if (!video || isPaused() || state.handledEnd || video.ended) return;
-    var now = Date.now();
-    if (now - state.lastResumeAttemptAt < 8000) return;
-    state.lastResumeAttemptAt = now;
-    state.resumeAttemptCount += 1;
-    if (state.resumeAttemptCount > 12) {
-      setStatus(STATUS.error, "播放器持续暂停，已停止自动恢复");
-      return;
-    }
-    log(reason + "，冷却后静音恢复播放 " + state.resumeAttemptCount + "/12");
-    schedule(function () {
-      if (!isPaused() && !state.handledEnd && video.paused && !video.ended) {
-        playVideo(video, 0);
+  function observeYuketangPause(video) {
+    if (!video) return function () {};
+    playYuketangVideo(video);
+    var target = document.getElementsByClassName("play-btn-tip")[0];
+    if (!target) return null;
+    var observer = new MutationObserver(function (list) {
+      for (var i = 0; i < list.length; i += 1) {
+        if (list[i].type === "childList" && textOf(target) === "播放" && !state.handledEnd && !isPaused() && !video.ended) {
+          playYuketangVideo(video);
+        }
       }
-    }, 1200);
+    });
+    observer.observe(target, { childList: true });
+    return function () {
+      observer.disconnect();
+    };
   }
 
   function isVideoNearlyEnded(video) {
