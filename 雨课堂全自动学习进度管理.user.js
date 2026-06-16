@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.5.1
+// @version      0.5.2
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
@@ -97,7 +97,8 @@
     lastUserGestureAt: 0,
     panelRenderTimer: 0,
     lastTrainingTarget: "",
-    trainingRevisits: 0
+    trainingRevisits: 0,
+    reacquiring: false
   };
 
   function getPageWindow() {
@@ -1572,6 +1573,7 @@
     if (existing && existing.__ytAutoAttached) return Promise.resolve();
     state.handledEnd = false;
     state.videoRetryCount = 0;
+    state.reacquiring = false;
     setStatus(STATUS.playing, "等待播放器");
     // 参考 OCS v2_watch：先等播放器就绪，通过 Vue API 配置倍速/音量并重新初始化，再取 video 元素接管。
     return retryWait(function () {
@@ -1640,7 +1642,7 @@
           if (isPaused() || state.handledEnd) return;
           try {
             video.load();
-            setupYuketangPlayer(readConfig().playbackRate);
+            applyYuketangSpeedLight(readConfig().playbackRate);
             playYuketangMedia(video);
           } catch (error) {
             console.warn(error);
@@ -1693,9 +1695,41 @@
     if (/interact|NotAllowed|gesture/i.test(message)) {
       setStatus(STATUS.playing, "浏览器拦截了自动播放，请在页面任意处点击一次即可自动继续");
       armUserGesturePlay(video);
-    } else {
-      log("播放失败：" + message);
+      return;
     }
+    // 播放器重建/切换清晰度会把旧 <video> 移出文档，旧的事件监听全部失效。
+    // 这种情况必须重新获取当前 video 并重新接管，否则整个自动流程会卡死。
+    if (/removed from the document|not in the document/i.test(message) || !document.contains(video)) {
+      reacquireVideo("播放被打断（媒体已被移除）");
+      return;
+    }
+    // “interrupted by a call to pause()/load()”等属于正常打断，忽略即可。
+    if (/interrupted/i.test(message)) return;
+    log("播放失败：" + message);
+  }
+
+  // 旧的 <video> 被播放器替换后，重新获取页面当前的 video 元素并重新接管。
+  function reacquireVideo(reason) {
+    if (isPaused() || state.handledEnd || state.reacquiring) return;
+    state.reacquiring = true;
+    log("重新接管播放器视频元素：" + reason);
+    var tryAttach = function (attemptsLeft) {
+      if (isPaused() || state.handledEnd) { state.reacquiring = false; return; }
+      var video = findVideoElement();
+      if (video && document.contains(video) && !video.__ytAutoAttached) {
+        state.reacquiring = false;
+        attachVideoAutomation(video, readConfig());
+        return;
+      }
+      if (video && video.__ytAutoAttached) { state.reacquiring = false; return; }
+      if (attemptsLeft <= 0) {
+        state.reacquiring = false;
+        refreshCurrentPage("视频元素被移除后未能重新接管");
+        return;
+      }
+      schedule(function () { tryAttach(attemptsLeft - 1); }, 1000);
+    };
+    schedule(function () { tryAttach(5); }, 600);
   }
 
   function armUserGesturePlay(video) {
@@ -1730,7 +1764,14 @@
     var nudgeCount = 0;
 
     var timer = window.setInterval(function () {
-      if (state.handledEnd || isPaused() || video.ended) return;
+      if (state.handledEnd || isPaused()) return;
+      if (!document.contains(video)) {
+        // 播放器重建了 video 元素：停止这个 watchdog，并重新接管当前页面的 video。
+        window.clearInterval(timer);
+        reacquireVideo("watchdog 检测到视频已被移除");
+        return;
+      }
+      if (video.ended) return;
       if (video.paused && detectVideoQuizPopup()) {
         // 弹题需要人工作答；不退出自动模式，作答后会自动继续播放。
         setStatus(STATUS.playing, "检测到视频内弹题，等待手动作答后自动继续");
@@ -1777,7 +1818,7 @@
       try {
         if (recoverAttempts >= 2) {
           video.load();
-          setupYuketangPlayer(readConfig().playbackRate);
+          applyYuketangSpeedLight(readConfig().playbackRate);
         }
         playYuketangMedia(video);
       } catch (error) {
@@ -1828,6 +1869,22 @@
     if (Number(effectiveRate) !== Number(normalizeRate(targetRate))) {
       log("目标倍速 " + targetRate + "x 不在播放器可选项，已使用 " + effectiveRate + "x");
     }
+  }
+
+  // 卡顿/出错恢复时用：只重设倍速，绝不调用 player.init()，避免重建 <video> 把已接管的元素移出文档。
+  function applyYuketangSpeedLight(targetRate) {
+    var effectiveRate = resolveYuketangRate(targetRate);
+    var context = findYuketangPlayerContext();
+    var player = context.player;
+    try {
+      if (player && player.options && player.options.speed) player.options.speed.value = effectiveRate;
+    } catch (error) { /* ignore */ }
+    var video = (player && player.video) || context.video || findVideoElement();
+    applyYuketangMediaDefaults(video);
+    if (video) {
+      try { video.playbackRate = effectiveRate; } catch (error) { /* ignore */ }
+    }
+    syncYuketangSpeedDom(effectiveRate);
   }
 
   function findYuketangPlayerContext() {
