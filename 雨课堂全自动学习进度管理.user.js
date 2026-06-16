@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.2.2
+// @version      0.2.3
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节。
 // @author       local
 // @license      MIT
@@ -79,7 +79,9 @@
     completedRouteKey: "",
     navigatingTo: "",
     navigationStartedAt: 0,
-    lastUserGestureAt: 0
+    lastUserGestureAt: 0,
+    lastResumeAttemptAt: 0,
+    resumeAttemptCount: 0
   };
 
   function readConfig() {
@@ -1410,6 +1412,8 @@
 
   function attachVideoAutomation(video, config) {
     setStatus(STATUS.playing, "已接管播放器，目标倍速 " + config.playbackRate + "x");
+    state.lastResumeAttemptAt = 0;
+    state.resumeAttemptCount = 0;
     prepareVideoForAutoplay(video);
     setupVideoRate(video, config.playbackRate);
 
@@ -1432,8 +1436,7 @@
       if (state.handledEnd || isPaused() || video.ended) return;
       schedule(function () {
         if (!state.handledEnd && !isPaused() && video.paused && !video.ended) {
-          log("检测到播放器暂停，自动恢复播放");
-          playVideo(video, 0);
+          requestResumePlayback(video, "检测到播放器暂停");
         }
       }, 1000);
     };
@@ -1462,7 +1465,6 @@
     video.addEventListener("ended", onEnded);
     video.addEventListener("pause", onPause);
     video.addEventListener("error", onError);
-    var pauseTipObserver = observePlayButtonTip(video);
     state.observerDisposers.push(function () {
       video.removeEventListener("timeupdate", onProgress);
       video.removeEventListener("progress", onProgress);
@@ -1470,26 +1472,9 @@
       video.removeEventListener("ended", onEnded);
       video.removeEventListener("pause", onPause);
       video.removeEventListener("error", onError);
-      if (pauseTipObserver) pauseTipObserver();
     });
 
     playVideo(video, 0);
-  }
-
-  function observePlayButtonTip(video) {
-    var tip = document.getElementsByClassName("play-btn-tip")[0];
-    if (!tip) return null;
-    var observer = new MutationObserver(function () {
-      if (state.handledEnd || isPaused() || video.ended) return;
-      if (textOf(tip) === "播放") {
-        log("播放器显示播放状态，自动恢复");
-        playVideo(video, 0);
-      }
-    });
-    observer.observe(tip, { childList: true, subtree: true, characterData: true });
-    return function () {
-      observer.disconnect();
-    };
   }
 
   function prepareVideoForAutoplay(video) {
@@ -1583,14 +1568,11 @@
   function handlePlayBlocked(video, error, attempt) {
     if (isPaused()) return;
     var maxAttempts = 6;
-    log("自动播放被阻止，尝试静音重试 " + (attempt + 1) + "/" + maxAttempts + "：" + (error && error.message ? error.message : "unknown"));
+    log("自动播放被阻止，静音重试 " + (attempt + 1) + "/" + maxAttempts + "：" + (error && error.message ? error.message : "unknown"));
     prepareVideoForAutoplay(video);
-    triggerPlayerPlayControl(video);
     if (attempt + 1 >= maxAttempts) {
-      setStatus(STATUS.error, "自动播放仍被浏览器阻止，等待页面允许播放");
-      schedule(function () {
-        if (!isPaused() && video.paused) playVideo(video, 0);
-      }, 5000);
+      setStatus(STATUS.error, "自动播放暂不可用，等待下一次恢复窗口");
+      requestResumePlayback(video, "自动播放被阻止");
       return;
     }
     schedule(function () {
@@ -1598,47 +1580,22 @@
     }, attempt < 2 ? 700 : 1800);
   }
 
-  function triggerPlayerPlayControl(video) {
-    var root = closestVideoRoot(video);
-    var candidates = Array.from((root || document).querySelectorAll("button,[role='button'],.play-btn-tip,.xt_video_player_play_btn,.xt_video_player_common_play,.xt_video_player_common_icon,xt-playbutton,xt-icon,span,div"))
-      .filter(isVisible)
-      .filter(function (node) {
-        var text = textOf(node);
-        var cls = String(node.className || "");
-        if (/暂停/.test(text)) return false;
-        return /播放|play/i.test(text + " " + cls) && text.length <= 20;
-      });
-    var control = candidates[0] || findCenterVideoOverlay(video);
-    if (!control) return false;
-    try {
-      control.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, view: window }));
-      control.click();
-      log("已触发播放器播放控件");
-      return true;
-    } catch (error) {
-      log("触发播放器播放控件失败：" + error.message);
-      return false;
+  function requestResumePlayback(video, reason) {
+    if (!video || isPaused() || state.handledEnd || video.ended) return;
+    var now = Date.now();
+    if (now - state.lastResumeAttemptAt < 8000) return;
+    state.lastResumeAttemptAt = now;
+    state.resumeAttemptCount += 1;
+    if (state.resumeAttemptCount > 12) {
+      setStatus(STATUS.error, "播放器持续暂停，已停止自动恢复");
+      return;
     }
-  }
-
-  function closestVideoRoot(video) {
-    var node = video;
-    while (node && node !== document.body) {
-      var cls = String(node.className || "");
-      if (/video|player|xtplayer|xt_video/i.test(cls)) return node;
-      node = node.parentElement;
-    }
-    return video.parentElement || document;
-  }
-
-  function findCenterVideoOverlay(video) {
-    if (!video || typeof document.elementsFromPoint !== "function") return null;
-    var rect = video.getBoundingClientRect();
-    var x = rect.left + rect.width / 2;
-    var y = rect.top + rect.height / 2;
-    return document.elementsFromPoint(x, y).find(function (node) {
-      return node !== video && node instanceof Element && isVisible(node);
-    }) || null;
+    log(reason + "，冷却后静音恢复播放 " + state.resumeAttemptCount + "/12");
+    schedule(function () {
+      if (!isPaused() && !state.handledEnd && video.paused && !video.ended) {
+        playVideo(video, 0);
+      }
+    }, 1200);
   }
 
   function isVideoNearlyEnded(video) {
