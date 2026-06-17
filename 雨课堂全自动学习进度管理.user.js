@@ -1702,7 +1702,7 @@
       writeProgress({
         videoTotal: chapters.length,
         videoDone: chapters.filter(function (c) { return c.complete; }).length,
-        currentCourse: getCurrentCourseTitle() || readProgress().currentCourse || ""
+        currentCourse: readProgress().currentCourse || getCurrentCourseTitle() || ""
       });
       requestRenderPanel();
       var next = findNextPlayableChapter(chapters);
