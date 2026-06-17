@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.6.5
+// @version      0.6.2
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
 // @match        https://kmustyjscfd.yuketang.cn/pro/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
@@ -477,17 +477,6 @@
     }, delayMs);
   }
 
-  function getVueRouter() {
-    try {
-      var app = document.querySelector("#app");
-      var vm = app && (app.__vue__ || (app.wrappedJSObject && app.wrappedJSObject.__vue__));
-      var router = vm && vm.$router;
-      return router && typeof router.push === "function" ? router : null;
-    } catch (error) {
-      return null;
-    }
-  }
-
   function navigateTo(url, reason) {
     if (!url) return false;
     clearRefreshCount();
@@ -501,30 +490,8 @@
       schedule(runRouter, 300);
       return true;
     }
-    // 优先用 SPA 路由跳转，避免整页刷新——保住焦点/上下文，也更快。
-    // 若 router.push 没有真正切换路由（多半是跨子应用），再回退整页跳转。
-    var target = new URL(absoluteUrl);
-    var router = target.origin === location.origin ? getVueRouter() : null;
-    if (router) {
-      var spaPath = target.pathname + target.search + target.hash;
-      try {
-        var result = router.push(spaPath);
-        if (result && typeof result.catch === "function") result.catch(function () { /* 忽略重复/中断跳转 */ });
-      } catch (error) {
-        log("SPA 路由跳转异常，回退整页跳转：" + error.message);
-        location.assign(absoluteUrl);
-        return true;
-      }
-      schedule(function () {
-        if (location.pathname === target.pathname) {
-          schedule(runRouter, 100);          // SPA 跳转成功（pushState 钩子通常已触发，这里兜底）
-        } else {
-          log("SPA 路由未生效，回退整页跳转");
-          location.assign(absoluteUrl);
-        }
-      }, 1200);
-      return true;
-    }
+    // 整页跳转：每个视频都需要整页加载来重新初始化播放器心跳（带正确的视频参数），
+    // 否则后端无法记进度。SPA router.push 会导致心跳参数不刷新 -> 进度恒为 0%。
     location.assign(absoluteUrl);
     return true;
   }
@@ -1881,9 +1848,8 @@
     }
   }
 
-  // 通过 .xtplayer 的 Vue 播放器 API 设置倍速/音量状态，并直接对 <video> 设倍速。
-  // 注意：不调用 player.init()——在该播放器版本上 init() 会重建/重载 video 元素，
-  // 导致 loadstart/暂停-播放 风暴、心跳无法连续上报、进度记不上（实测）。倍速靠 video.playbackRate 已能生效。
+  // 参考 OCS v2_watch：通过 .xtplayer 的 Vue 播放器 API 设置倍速/音量，再 player.init() 让其生效，
+  // 而不是反复改写 video.playbackRate 与播放器抢控制权。
   function setupYuketangPlayer(targetRate) {
     var effectiveRate = resolveYuketangRate(targetRate);
     var context = findYuketangPlayerContext();
@@ -1892,6 +1858,7 @@
       if (player && player.options) {
         if (player.options.speed) player.options.speed.value = effectiveRate;
         if (player.options.volume) player.options.volume.value = 0;
+        if (typeof player.init === "function") player.init();
       }
     } catch (error) {
       log("通过播放器 API 配置失败，回退到直接设置：" + error.message);
@@ -2183,6 +2150,97 @@
     refreshCurrentPage(fallbackMessage);
   }
 
+  // 防切屏：浏览器不允许用代码把后台标签页切到前台（window.focus() 对后台标签无效），
+  // 因此改为让页面始终被判定为“可见且有焦点”，从而阻止雨课堂在标签页未聚焦时反复暂停视频。
+  function preventScreenCheck() {
+    var win = getPageWindow();
+    var docs = [];
+    [(win && win.document) || null, document].forEach(function (d) {
+      if (d && docs.indexOf(d) < 0) docs.push(d);
+    });
+    var blocked = ["visibilitychange", "webkitvisibilitychange", "mozvisibilitychange", "blur", "pagehide"];
+
+    function defineVisible(obj, prop, getter) {
+      try {
+        Object.defineProperty(obj, prop, { configurable: true, get: getter });
+      } catch (error) { /* 某些环境下不可重定义，忽略 */ }
+    }
+    docs.forEach(function (d) {
+      defineVisible(d, "hidden", function () { return false; });
+      defineVisible(d, "webkitHidden", function () { return false; });
+      defineVisible(d, "mozHidden", function () { return false; });
+      defineVisible(d, "visibilityState", function () { return "visible"; });
+      defineVisible(d, "webkitVisibilityState", function () { return "visible"; });
+      try { d.hasFocus = function () { return true; }; } catch (error) { /* ignore */ }
+    });
+
+    // 拦截“之后”注册的切屏/失焦监听（脚本早于播放器加载时最有效）。
+    function wrapAdd(target) {
+      if (!target || target.__ytAecWrapped) return;
+      var original = target.addEventListener;
+      if (typeof original !== "function") return;
+      target.__ytAecOrigAdd = original;
+      target.addEventListener = function (type) {
+        if (blocked.indexOf(String(type)) >= 0) return undefined;
+        return original.apply(this, arguments);
+      };
+      target.__ytAecWrapped = true;
+    }
+    [win].concat(docs).forEach(wrapAdd);
+
+    // 兜底：用原始 addEventListener 在捕获阶段吞掉这些事件，尽量拦住已注册的处理器。
+    function swallow(event) {
+      try { event.stopImmediatePropagation(); } catch (error) { /* ignore */ }
+    }
+    [win].concat(docs).forEach(function (target) {
+      if (!target) return;
+      var add = target.__ytAecOrigAdd || target.addEventListener;
+      blocked.forEach(function (type) {
+        try { add.call(target, type, swallow, true); } catch (error) { /* ignore */ }
+      });
+    });
+  }
+
+  // 让后台/失焦标签页不被浏览器节流，从而保证雨课堂的心跳定时器按真实节奏上报、进度记满。
+  // 关键手段：用近乎静音的音频让浏览器把本标签页标记为“正在播放声音”——可发声的标签页会被豁免后台定时器节流。
+  // 注意：AudioContext 需要一次用户手势才能真正出声；纯无界面服务器上手势永远不来，
+  // 这种环境必须用 Chrome 启动参数（见 README/下方说明）来彻底关闭节流。
+  function installFocusKeepAlive() {
+    var win = getPageWindow();
+    var started = false;
+
+    function startAudioKeepAlive() {
+      if (started) return;
+      try {
+        var Ctx = win.AudioContext || win.webkitAudioContext || window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        var ctx = new Ctx();
+        var osc = ctx.createOscillator();
+        var gain = ctx.createGain();
+        gain.gain.value = 0.001;     // 近乎静音
+        osc.frequency.value = 1;     // 次声，听不见
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        if (ctx.state === "suspended" && typeof ctx.resume === "function") ctx.resume();
+        state.__ytAudioCtx = ctx;    // 持有引用避免被回收
+        started = ctx.state === "running";
+        if (started) log("已启动静音音频保活，避免后台标签页被节流");
+      } catch (error) { /* ignore */ }
+    }
+
+    var onGesture = function () {
+      startAudioKeepAlive();
+      if (started) {
+        document.removeEventListener("click", onGesture, true);
+        document.removeEventListener("keydown", onGesture, true);
+      }
+    };
+    startAudioKeepAlive();                 // 先试一次（部分环境无需手势）
+    document.addEventListener("click", onGesture, true);
+    document.addEventListener("keydown", onGesture, true);
+  }
+
   function installNavigationHooks() {
     var originalPushState = history.pushState;
     var originalReplaceState = history.replaceState;
@@ -2200,7 +2258,18 @@
     window.addEventListener("hashchange", function () { schedule(runRouter, 300); });
   }
 
-  initPanel();
-  installNavigationHooks();
-  schedule(runRouter, 300);
+  // 立即执行防切屏（document-start 时机最早，能在播放器注册监听前生效）。
+  preventScreenCheck();
+
+  function bootstrap() {
+    installFocusKeepAlive();
+    initPanel();
+    installNavigationHooks();
+    schedule(runRouter, 300);
+  }
+  if (document.body) {
+    bootstrap();
+  } else {
+    document.addEventListener("DOMContentLoaded", bootstrap, { once: true });
+  }
 })();
