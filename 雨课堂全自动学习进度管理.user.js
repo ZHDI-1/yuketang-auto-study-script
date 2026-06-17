@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.7.0
+// @version      0.7.1
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
@@ -72,11 +72,12 @@
   };
   var STATUS = {
     idle: "空闲",
-    scanning: "扫描中",
+    scanning: "运行中",
     playing: "播放中",
-    complete: "完成",
+    complete: "已完成",
     paused: "已暂停",
-    error: "需干预"
+    blocked: "需处理",
+    retrying: "重试中"
   };
   var state = {
     status: STATUS.idle,
@@ -345,9 +346,16 @@
     return Boolean(readConfig().paused);
   }
 
+  // 用户主动暂停：可随时“继续”。
   function pause(reason) {
     writeConfig({ paused: true });
-    setStatus(STATUS.paused, reason || "自动流程已暂停");
+    setStatus(STATUS.paused, reason || "已暂停，点击“继续”恢复");
+  }
+
+  // 脚本无法自行继续、需要人来处理（登录失效、找不到课程等）。处理后点“继续”。
+  function block(reason) {
+    writeConfig({ paused: true });
+    setStatus(STATUS.blocked, reason || "需要手动处理后点击“继续”");
   }
 
   function resume() {
@@ -501,7 +509,7 @@
     try { count = Number(window.sessionStorage.getItem(key) || 0) || 0; } catch (error) { count = 0; }
     try { window.sessionStorage.setItem(key, String(count + 1)); } catch (error) { /* ignore */ }
     var delayMs = count < 4 ? 3000 : (count < 8 ? 8000 : 20000);
-    setStatus(STATUS.error, reason + "，" + Math.round(delayMs / 1000) + " 秒后刷新本页重试（第 " + (count + 1) + " 次，自动模式保持开启）");
+    setStatus(STATUS.retrying, reason + "，" + Math.round(delayMs / 1000) + " 秒后自动刷新本页重试（第 " + (count + 1) + " 次）");
     schedule(function () {
       if (!isPaused()) location.reload();
     }, delayMs);
@@ -572,7 +580,7 @@
 
   function ensureLoggedIn() {
     if (looksLoggedOut()) {
-      pause("请先登录");
+      block("请先登录后点击“继续”");
       return false;
     }
     return true;
@@ -590,9 +598,11 @@
       "#yt-auto-panel header .yt-h-title{font-weight:700;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
       "#yt-auto-panel .yt-badge{flex:0 0 auto;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600;background:rgba(255,255,255,.22);color:#fff}",
       "#yt-auto-panel .yt-badge[data-variant='playing']{background:#22c55e}",
-      "#yt-auto-panel .yt-badge[data-variant='scanning']{background:#f59e0b}",
+      "#yt-auto-panel .yt-badge[data-variant='working']{background:#f59e0b}",
       "#yt-auto-panel .yt-badge[data-variant='complete']{background:#10b981}",
-      "#yt-auto-panel .yt-badge[data-variant='error']{background:#ef4444}",
+      "#yt-auto-panel .yt-badge[data-variant='blocked']{background:#ef4444}",
+      "#yt-auto-panel .yt-badge.yt-live{animation:yt-pulse 1.4s ease-in-out infinite}",
+      "@keyframes yt-pulse{0%,100%{opacity:1}50%{opacity:.55}}",
       "#yt-auto-panel .yt-collapse{flex:0 0 auto;width:24px;height:24px;padding:0;border:none;border-radius:6px;background:rgba(255,255,255,.2);color:#fff;cursor:pointer;font-size:15px;line-height:1}",
       "#yt-auto-panel main{padding:12px}",
       "#yt-auto-panel .yt-msg{color:#374151;word-break:break-word;min-height:18px}",
@@ -623,17 +633,18 @@
       "#yt-auto-panel .yt-item .yt-meta{font-size:11px;color:#94a3b8}",
       "#yt-auto-panel .yt-item button{flex:0 0 auto;height:26px;font-size:12px}",
       "#yt-auto-panel .yt-empty{color:#94a3b8;font-size:12px;text-align:center;padding:8px 0}",
-      "#yt-auto-panel .yt-logtoggle{cursor:pointer;color:#64748b;font-size:12px;user-select:none;padding:7px 0 3px;border-top:1px solid #eef2f7;margin-top:6px}",
+      "#yt-auto-panel .yt-toggle{cursor:pointer;color:#64748b;font-size:12px;user-select:none;padding:7px 0 3px;border-top:1px solid #eef2f7;margin-top:6px}",
       "#yt-auto-panel .yt-log{max-height:96px;overflow:auto;color:#94a3b8;font-size:11px;font-family:ui-monospace,Menlo,Consolas,monospace}",
       "#yt-auto-panel .yt-log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
       "#yt-auto-panel.yt-loghide .yt-log{display:none}",
+      "#yt-auto-panel.yt-listhide .yt-list{display:none}",
       "#yt-auto-panel.yt-collapsed main{display:none}",
       "#yt-auto-panel.yt-collapsed{width:auto}"
     ].join("");
 
     var panel = document.createElement("section");
     panel.id = "yt-auto-panel";
-    panel.className = "yt-loghide";
+    panel.className = "yt-loghide yt-listhide";
     panel.innerHTML = [
       "<header>",
       "  <span class='yt-h-title'>雨课堂自动学习</span>",
@@ -644,23 +655,19 @@
       "  <div class='yt-msg' data-role='message'></div>",
       "  <div class='yt-sub' data-role='sub'></div>",
       "  <div class='yt-card'>",
-      "    <div class='yt-prog'>",
-      "      <div class='yt-prog-head'><b>课程进度</b><span data-role='course-count'>—</span></div>",
-      "      <div class='yt-bar'><div class='yt-bar-fill course' data-role='course-bar'></div></div>",
+      "    <div class='yt-prog' data-role='prog1'>",
+      "      <div class='yt-prog-head'><b data-role='prog1-label'>课程进度</b><span data-role='prog1-count'>—</span></div>",
+      "      <div class='yt-bar'><div class='yt-bar-fill course' data-role='prog1-bar'></div></div>",
       "    </div>",
-      "    <div class='yt-prog'>",
-      "      <div class='yt-prog-head'><b>本课视频</b><span data-role='video-count'>—</span></div>",
-      "      <div class='yt-bar'><div class='yt-bar-fill' data-role='video-bar'></div></div>",
+      "    <div class='yt-prog' data-role='prog2'>",
+      "      <div class='yt-prog-head'><b data-role='prog2-label'>本课视频</b><span data-role='prog2-count'>—</span></div>",
+      "      <div class='yt-bar'><div class='yt-bar-fill' data-role='prog2-bar'></div></div>",
       "    </div>",
       "    <div class='yt-cur' data-role='current'></div>",
       "  </div>",
       "  <div class='yt-row'>",
-      "    <button class='yt-primary' type='button' data-action='start'>▶ 一键启动</button>",
-      "    <button class='yt-danger' type='button' data-action='pause'>⏸ 暂停</button>",
-      "  </div>",
-      "  <div class='yt-row'>",
+      "    <button class='yt-primary' type='button' data-action='toggle'>▶ 启动</button>",
       "    <button type='button' data-action='scan'>扫描并进入</button>",
-      "    <button type='button' data-action='resetQueue'>重置队列</button>",
       "  </div>",
       "  <div class='yt-row'>",
       "    <label><input type='checkbox' data-field='autoStart'>自动模式</label>",
@@ -670,8 +677,12 @@
       "    <input type='text' data-field='targetCourseName' placeholder='指定课程名，留空选第一个' style='flex:1'>",
       "    <button type='button' data-action='save' style='flex:0 0 auto'>保存</button>",
       "  </div>",
+      "  <div class='yt-row'>",
+      "    <button type='button' data-action='resetQueue'>重置队列</button>",
+      "  </div>",
+      "  <div class='yt-toggle' data-action='toggleList'>页面项目 ▾</div>",
       "  <div class='yt-list' data-role='items'></div>",
-      "  <div class='yt-logtoggle' data-action='toggleLog'>运行日志 ▾</div>",
+      "  <div class='yt-toggle' data-action='toggleLog'>运行日志 ▾</div>",
       "  <div class='yt-log' data-role='logs'></div>",
       "</main>"
     ].join("");
@@ -705,11 +716,14 @@
         }
         return;
       }
-      if (action === "start") {
-        savePanelConfig();
-        resume();
-      } else if (action === "pause") {
-        pause("用户手动暂停");
+      if (action === "toggle") {
+        // 单一主按钮：暂停态/未启动 → 启动或继续；运行中 → 暂停。
+        if (isPaused() || !readConfig().autoStart) {
+          savePanelConfig();
+          resume();
+        } else {
+          pause("用户手动暂停");
+        }
       } else if (action === "scan") {
         savePanelConfig();
         writeConfig({ paused: false });
@@ -719,10 +733,12 @@
       } else if (action === "save") {
         savePanelConfig();
         setStatus(STATUS.idle, "配置已保存");
+      } else if (action === "toggleList") {
+        var listHidden = panel.classList.toggle("yt-listhide");
+        target.textContent = "页面项目 " + (listHidden ? "▾" : "▴");
       } else if (action === "toggleLog") {
-        var hidden = panel.classList.toggle("yt-loghide");
-        var toggle = panel.querySelector("[data-action='toggleLog']");
-        if (toggle) toggle.textContent = hidden ? "运行日志 ▾" : "运行日志 ▴";
+        var logHidden = panel.classList.toggle("yt-loghide");
+        target.textContent = "运行日志 " + (logHidden ? "▾" : "▴");
       }
     });
 
@@ -793,22 +809,40 @@
     var config = readConfig();
     var prog = readProgress();
 
+    var queue = readQueue();
+
     var status = panel.querySelector("[data-role='status']");
     if (status) {
       status.textContent = state.status;
       status.setAttribute("data-variant", statusVariant(state.status));
+      status.classList.toggle("yt-live", isActiveStatus(state.status));
     }
     setPanelText(panel, "message", state.message || "");
     setPanelText(panel, "sub", describeFlow());
 
-    renderProgressBar(panel, "course", prog.courseDone, prog.courseTotal);
-    renderProgressBar(panel, "video", prog.videoDone, prog.videoTotal);
+    // 主按钮随状态变化：暂停态→继续；未启动→启动；运行中→暂停。
+    var toggle = panel.querySelector("[data-action='toggle']");
+    if (toggle) {
+      if (config.paused) toggle.textContent = "▶ 继续";
+      else if (!config.autoStart) toggle.textContent = "▶ 启动";
+      else toggle.textContent = "⏸ 暂停";
+    }
+
+    // 进度卡片按阶段切换：选课阶段显示选课进度（单条），学习阶段显示课程+本课视频（两条）。
+    if (queue.phase === "selecting") {
+      setProg(panel, "prog1", "选课进度", queue.index, queue.items.length, true);
+      showProg(panel, "prog2", false);
+    } else {
+      setProg(panel, "prog1", "课程进度", prog.courseDone, prog.courseTotal, true);
+      showProg(panel, "prog2", true);
+      setProg(panel, "prog2", "本课视频", prog.videoDone, prog.videoTotal, false);
+    }
     var current = panel.querySelector("[data-role='current']");
     if (current) {
       var parts = [];
       if (prog.currentCourse) parts.push("<b>" + escapeHtml(prog.currentCourse) + "</b>");
       if (prog.currentVideo) parts.push(escapeHtml(prog.currentVideo));
-      current.innerHTML = parts.length ? ("正在学习：" + parts.join(" · ")) : "";
+      current.innerHTML = (parts.length && queue.phase !== "selecting") ? ("正在学习：" + parts.join(" · ")) : "";
     }
 
     var autoStart = panel.querySelector("[data-field='autoStart']");
@@ -833,26 +867,37 @@
     if (el) el.textContent = text;
   }
 
-  function renderProgressBar(panel, key, done, total) {
+  function showProg(panel, key, visible) {
+    var row = panel.querySelector("[data-role='" + key + "']");
+    if (row) row.style.display = visible ? "" : "none";
+  }
+
+  function setProg(panel, key, label, done, total, isCourse) {
     done = Math.max(0, Number(done) || 0);
     total = Math.max(0, Number(total) || 0);
+    showProg(panel, key, true);
+    var labelEl = panel.querySelector("[data-role='" + key + "-label']");
     var countEl = panel.querySelector("[data-role='" + key + "-count']");
     var barEl = panel.querySelector("[data-role='" + key + "-bar']");
-    if (countEl) {
-      countEl.textContent = total > 0 ? (done + " / " + total + "（剩 " + Math.max(0, total - done) + "）") : "—";
-    }
+    if (labelEl) labelEl.textContent = label;
+    if (countEl) countEl.textContent = total > 0 ? (done + " / " + total + "（剩 " + Math.max(0, total - done) + "）") : "—";
     if (barEl) {
       barEl.style.width = (total > 0 ? Math.min(100, Math.round(done / total * 100)) : 0) + "%";
+      barEl.className = "yt-bar-fill" + (isCourse ? " course" : "");
     }
   }
 
   function statusVariant(status) {
     if (status === STATUS.playing) return "playing";
-    if (status === STATUS.scanning) return "scanning";
+    if (status === STATUS.scanning || status === STATUS.retrying) return "working";
     if (status === STATUS.complete) return "complete";
     if (status === STATUS.paused) return "paused";
-    if (status === STATUS.error) return "error";
+    if (status === STATUS.blocked) return "blocked";
     return "idle";
+  }
+
+  function isActiveStatus(status) {
+    return status === STATUS.playing || status === STATUS.scanning || status === STATUS.retrying;
   }
 
   function describeFlow() {
@@ -933,7 +978,7 @@
     if (name === "courseAbout") {
       var goLearn = findGoLearnButton();
       if (goLearn) clickElement(goLearn, "进入学习");
-      else pause("当前课程介绍页未找到去学习按钮");
+      else block("当前课程介绍页未找到去学习按钮");
       return;
     }
     if (name === "myTraining") {
@@ -1035,7 +1080,7 @@
     return collectCourseQueueFromSelectPage(config, false).then(function (items) {
       if (isPaused()) return;
       if (!items.length) {
-        pause(config.targetCourseName ? "未找到指定课程：" + config.targetCourseName : "课程列表无可用课程");
+        block(config.targetCourseName ? "未找到指定课程：" + config.targetCourseName : "课程列表无可用课程");
         return;
       }
       goToQueuedCourse("课程队列已建立");
