@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.8.4
+// @version      0.8.5
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
@@ -183,6 +183,8 @@
   // 学习进度汇总（持久化，跨整页跳转仍可在面板展示）：
   // courseTotal/courseDone 来自培训进度页；videoTotal/videoDone 来自当前课程的学习内容页。
   var PROGRESS_KEY = "yt_auto.progress";
+  var COMPLETED_COURSES_KEY = "yt_auto.completedCourses";
+  var COMPLETED_CHAPTERS_KEY = "yt_auto.completedChapters";
   var SKIPPED_COURSES_KEY = "yt_auto.skippedCourses";
   var SKIPPED_CHAPTERS_KEY = "yt_auto.skippedChapters";
   var CURRENT_CHAPTER_KEY = "yt_auto.currentChapter";
@@ -212,6 +214,8 @@
   }
 
   function clearSkipState() {
+    writeStore(COMPLETED_COURSES_KEY, {});
+    writeStore(COMPLETED_CHAPTERS_KEY, {});
     writeStore(SKIPPED_COURSES_KEY, {});
     writeStore(SKIPPED_CHAPTERS_KEY, {});
     GM_setValue(CURRENT_CHAPTER_KEY, "");
@@ -254,9 +258,73 @@
     return Boolean(readStore(SKIPPED_COURSES_KEY)[courseSkipKey(title, trainingId)]);
   }
 
+  function markCourseCompleted(title, reason, trainingId) {
+    title = String(title || "").trim();
+    if (!title) return;
+    var store = readStore(COMPLETED_COURSES_KEY);
+    store[courseSkipKey(title, trainingId)] = {
+      title: title,
+      reason: reason || "本地章节已完成",
+      at: Date.now()
+    };
+    writeStore(COMPLETED_COURSES_KEY, store);
+    log("本地标记课程已完成：" + title + "（" + (reason || "本地章节已完成") + "）");
+  }
+
+  function isCourseCompletedLocally(title, trainingId) {
+    title = String(title || "").trim();
+    if (!title) return false;
+    return Boolean(readStore(COMPLETED_COURSES_KEY)[courseSkipKey(title, trainingId)]);
+  }
+
+  function markCurrentCourseCompleted(reason) {
+    var progress = readProgress();
+    var current = readCurrentChapter();
+    var queueItem = currentQueueItem();
+    var title = progress.currentCourse || current.courseTitle || getCurrentCourseTitle() || (queueItem && queueItem.title) || "";
+    markCourseCompleted(title, reason || "本地章节已完成", current.trainingId);
+  }
+
   function chapterSkipRecord(key) {
     key = String(key || "");
     return key ? readStore(SKIPPED_CHAPTERS_KEY)[key] || null : null;
+  }
+
+  function chapterCompletedRecord(key) {
+    key = String(key || "");
+    return key ? readStore(COMPLETED_CHAPTERS_KEY)[key] || null : null;
+  }
+
+  function markChapterCompleted(chapter, reason) {
+    var key = chapter && chapter.key ? String(chapter.key) : "";
+    if (!key) return;
+    var store = readStore(COMPLETED_CHAPTERS_KEY);
+    store[key] = {
+      title: chapter.title || "",
+      reason: reason || "直播回放已完成",
+      at: Date.now()
+    };
+    writeStore(COMPLETED_CHAPTERS_KEY, store);
+    log("本地标记直播章节已完成：" + (chapter.title || key) + "（" + (reason || "直播回放已完成") + "）");
+  }
+
+  function markCurrentChapterCompleted(reason) {
+    var current = readCurrentChapter();
+    if (!currentChapterMatchesPage(current)) return;
+    if (current && current.key) markChapterCompleted(current, reason || "直播回放已完成");
+  }
+
+  function currentChapterMatchesPage(chapter) {
+    if (!chapter || !chapter.key) return false;
+    if (routeName() !== "lesson") return true;
+    var match = location.pathname.match(/\/pro\/yktmanage\/s\/([^/]+)\/lesson\//);
+    if (!match) return true;
+    var parts = String(chapter.key || "").split("|");
+    return parts.length >= 2 && String(parts[1]) === decodeURIComponent(match[1]);
+  }
+
+  function isChapterCompleted(item) {
+    return Boolean(item && item.key && chapterCompletedRecord(item.key));
   }
 
   function markChapterSkipped(chapter, reason) {
@@ -421,7 +489,7 @@
 
   function skipCurrentChapter(reason) {
     var current = readCurrentChapter();
-    if (current && current.key) markChapterSkipped(current, reason || "当前章节无可播放内容");
+    if (current && current.key && currentChapterMatchesPage(current)) markChapterSkipped(current, reason || "当前章节无可播放内容");
     var studyUrl = (current && current.studyUrl) || GM_getValue("yt_auto.studyUrl", "");
     if (studyUrl) {
       setStatus(STATUS.scanning, (reason || "当前章节无可播放内容") + "，返回学习内容页继续扫描");
@@ -678,7 +746,9 @@
     if (chapter.title) writeProgress({ currentVideo: chapter.title });
     writeCurrentChapter({
       key: chapter.key || "",
+      leafId: chapter.leafId || "",
       title: chapter.title || "",
+      live: Boolean(chapter.live),
       studyUrl: routeName() === "studyContent" ? location.href : (GM_getValue("yt_auto.studyUrl", "") || ""),
       courseTitle: readProgress().currentCourse || getCurrentCourseTitle() || "",
       trainingId: activeTrainingId(),
@@ -1072,11 +1142,12 @@
     if (name === "myTraining") {
       container.innerHTML = state.courseItems.length ? state.courseItems.slice(0, 20).map(function (item) {
         var skipped = isCourseSkipped(item.title);
+        var localDone = isCourseCompletedLocally(item.title);
         return [
           "<div class='yt-item'>",
           "  <div style='min-width:0'>",
-          "    <div class='yt-title' title='" + escapeHtml(item.title) + "'>" + (item.complete ? "✓ " : (skipped ? "↷ " : "")) + escapeHtml(item.title) + "</div>",
-          "    <div class='yt-meta'>" + (skipped ? "本轮已跳过 · " : "") + "进度 " + escapeHtml(item.progressText || "") + "</div>",
+          "    <div class='yt-title' title='" + escapeHtml(item.title) + "'>" + ((item.complete || localDone) ? "✓ " : (skipped ? "↷ " : "")) + escapeHtml(item.title) + "</div>",
+          "    <div class='yt-meta'>" + (localDone ? "本地已完成 · " : (skipped ? "本轮已跳过 · " : "")) + "进度 " + escapeHtml(item.progressText || "") + "</div>",
           "  </div>",
           "</div>"
         ].join("");
@@ -1534,7 +1605,7 @@
       }
       requestRenderPanel();
       var next = rows.find(function (row) {
-        return !row.complete && row.action && !isCourseSkipped(row.title);
+        return !row.complete && row.action && !isCourseSkipped(row.title) && !isCourseCompletedLocally(row.title);
       });
       if (!next) {
         state.lastTrainingTarget = "";
@@ -1542,7 +1613,10 @@
         var skippedCount = rows.filter(function (row) {
           return !row.complete && row.action && isCourseSkipped(row.title);
         }).length;
-        setStatus(STATUS.complete, skippedCount ? ("已选课程全部完成或本轮跳过不可学习课程 " + skippedCount + " 门") : "已选课程全部完成");
+        var localDoneCount = rows.filter(function (row) {
+          return !row.complete && row.action && isCourseCompletedLocally(row.title);
+        }).length;
+        setStatus(STATUS.complete, (skippedCount || localDoneCount) ? ("已选课程全部完成或本地处理完成 " + (skippedCount + localDoneCount) + " 门") : "已选课程全部完成");
         return;
       }
       if (state.lastTrainingTarget === next.title) {
@@ -1719,6 +1793,7 @@
         skipCurrentCourse("当前课程剩余章节无可播放回放");
         return;
       }
+      if (chapters.length) markCurrentCourseCompleted("当前课程章节已完成");
       completeCurrentCourse("当前课程没有未完成视频章节");
     });
   }
@@ -1799,7 +1874,6 @@
         var isLive = type === 8;    // 直播/线下课堂的回放
         if (!isVideo && !isLive) return;
         var progress = Number(schedules[leaf.id] || 0);
-        var complete = progress >= 1;
         var title = leaf.name || chapter.name || ((isLive ? "直播回放 " : "视频 ") + leaf.id);
         // 普通视频用 /video/{id} 直接导航；直播回放没有该地址，必须点击章节里的 .leaf-detail
         // 让平台自己跳到 /pro/yktmanage/s/.../lesson/...。
@@ -1809,6 +1883,8 @@
         var leafEl = findLeafDetailByTitle(title);
         var key = buildChapterKey(sign, classroomId, leaf.id);
         var skipped = Boolean(chapterSkipRecord(key));
+        var localCompleted = Boolean(chapterCompletedRecord(key));
+        var complete = isLive ? localCompleted : progress >= 1;
         items.push({
           key: key,
           leafId: String(leaf.id),
@@ -1821,7 +1897,7 @@
           typeLabel: isLive ? "直播回放" : "视频",
           complete: complete,
           progress: progress,
-          statusLabel: skipped ? "本轮已跳过" : (complete ? "已完成" : Math.floor(progress * 100) + "%"),
+          statusLabel: skipped ? "本轮已跳过" : (complete ? (isLive ? "本地已完成" : "已完成") : (isLive ? "待检查回放" : Math.floor(progress * 100) + "%")),
           pendingAction: isLive && !leafEl,
           locked: false
         });
@@ -2160,6 +2236,7 @@
   }
 
   function goNextAfterLesson(video, reason) {
+    markCurrentChapterCompleted(reason || "直播回放播放结束");
     setStatus(STATUS.scanning, (reason || "直播回放结束") + "，10 秒后返回学习内容页重新调度");
     delay(LIVE_NEXT_WAIT_MS).then(function () {
       if (isPaused()) return;
