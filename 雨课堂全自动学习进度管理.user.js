@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.5.5
+// @version      0.6.0
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
@@ -2199,6 +2199,46 @@
     });
   }
 
+  // 让后台/失焦标签页不被浏览器节流，从而保证雨课堂的心跳定时器按真实节奏上报、进度记满。
+  // 关键手段：用近乎静音的音频让浏览器把本标签页标记为“正在播放声音”——可发声的标签页会被豁免后台定时器节流。
+  // 注意：AudioContext 需要一次用户手势才能真正出声；纯无界面服务器上手势永远不来，
+  // 这种环境必须用 Chrome 启动参数（见 README/下方说明）来彻底关闭节流。
+  function installFocusKeepAlive() {
+    var win = getPageWindow();
+    var started = false;
+
+    function startAudioKeepAlive() {
+      if (started) return;
+      try {
+        var Ctx = win.AudioContext || win.webkitAudioContext || window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        var ctx = new Ctx();
+        var osc = ctx.createOscillator();
+        var gain = ctx.createGain();
+        gain.gain.value = 0.001;     // 近乎静音
+        osc.frequency.value = 1;     // 次声，听不见
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        if (ctx.state === "suspended" && typeof ctx.resume === "function") ctx.resume();
+        state.__ytAudioCtx = ctx;    // 持有引用避免被回收
+        started = ctx.state === "running";
+        if (started) log("已启动静音音频保活，避免后台标签页被节流");
+      } catch (error) { /* ignore */ }
+    }
+
+    var onGesture = function () {
+      startAudioKeepAlive();
+      if (started) {
+        document.removeEventListener("click", onGesture, true);
+        document.removeEventListener("keydown", onGesture, true);
+      }
+    };
+    startAudioKeepAlive();                 // 先试一次（部分环境无需手势）
+    document.addEventListener("click", onGesture, true);
+    document.addEventListener("keydown", onGesture, true);
+  }
+
   function installNavigationHooks() {
     var originalPushState = history.pushState;
     var originalReplaceState = history.replaceState;
@@ -2220,6 +2260,7 @@
   preventScreenCheck();
 
   function bootstrap() {
+    installFocusKeepAlive();
     initPanel();
     installNavigationHooks();
     schedule(runRouter, 300);
