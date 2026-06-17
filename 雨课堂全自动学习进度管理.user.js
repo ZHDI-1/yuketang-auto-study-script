@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.6.0
+// @version      0.6.1
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
@@ -477,6 +477,17 @@
     }, delayMs);
   }
 
+  function getVueRouter() {
+    try {
+      var app = document.querySelector("#app");
+      var vm = app && (app.__vue__ || (app.wrappedJSObject && app.wrappedJSObject.__vue__));
+      var router = vm && vm.$router;
+      return router && typeof router.push === "function" ? router : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
   function navigateTo(url, reason) {
     if (!url) return false;
     clearRefreshCount();
@@ -488,6 +499,30 @@
       state.navigatingTo = "";
       state.navigationStartedAt = 0;
       schedule(runRouter, 300);
+      return true;
+    }
+    // 优先用 SPA 路由跳转，避免整页刷新——保住静音保活/焦点状态，也更快。
+    // 若 router.push 没有真正切换路由（多半是跨子应用），再回退整页跳转。
+    var target = new URL(absoluteUrl);
+    var router = target.origin === location.origin ? getVueRouter() : null;
+    if (router) {
+      var spaPath = target.pathname + target.search + target.hash;
+      try {
+        var result = router.push(spaPath);
+        if (result && typeof result.catch === "function") result.catch(function () { /* 忽略重复/中断跳转 */ });
+      } catch (error) {
+        log("SPA 路由跳转异常，回退整页跳转：" + error.message);
+        location.assign(absoluteUrl);
+        return true;
+      }
+      schedule(function () {
+        if (location.pathname === target.pathname) {
+          schedule(runRouter, 100);          // SPA 跳转成功（pushState 钩子通常已触发，这里兜底）
+        } else {
+          log("SPA 路由未生效，回退整页跳转");
+          location.assign(absoluteUrl);
+        }
+      }, 1200);
       return true;
     }
     location.assign(absoluteUrl);
