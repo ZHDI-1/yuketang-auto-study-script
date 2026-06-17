@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.8.0
+// @version      0.8.1
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
@@ -1845,17 +1845,23 @@
     return acc;
   }
 
-  function findVideoElement() {
-    var videos = collectVideos(document, [], 0).filter(function (video) {
+  function pickLargestVideo(list) {
+    var videos = list.filter(function (video) {
       return isVisible(video) || video.readyState > 0 || video.duration;
     });
-    if (videos.length) {
-      videos.sort(function (a, b) {
-        return (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight);
-      });
-      return videos[0];
-    }
-    return null;
+    if (!videos.length) return null;
+    videos.sort(function (a, b) {
+      return (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight);
+    });
+    return videos[0];
+  }
+
+  function findVideoElement() {
+    // 普通视频页 <video> 就在顶层文档：优先用它，行为与改动前完全一致。
+    var top = pickLargestVideo(Array.from(document.querySelectorAll("video")));
+    if (top) return top;
+    // 顶层没有时（直播回放页）再深入同源 iframe 查找。
+    return pickLargestVideo(collectVideos(document, [], 0));
   }
 
   function attachVideoAutomation(video, config) {
