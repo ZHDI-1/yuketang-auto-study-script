@@ -29,6 +29,7 @@
   var ROUTE_STABLE_WAIT_MS = 5000;
   var POST_VIDEO_RESCAN_WAIT_MS = 5000;
   var VIDEO_END_SYNC_WAIT_MS = 7000;
+  var LIVE_HEARTBEAT_SYNC_WAIT_MS = 12000;
   var POST_HEARTBACK_SETTLE_MS = 1500;
   var PANEL_RENDER_THROTTLE_MS = 200;
   var WAIT_MUTATION_THROTTLE_MS = 250;
@@ -100,7 +101,11 @@
     panelRenderTimer: 0,
     lastTrainingTarget: "",
     trainingRevisits: 0,
-    reacquiring: false
+    reacquiring: false,
+    liveHeartbeatAt: 0,
+    liveHeartbeatLessonAt: 0,
+    liveHeartbeatVideoEndAt: 0,
+    liveHeartbeatEvents: []
   };
 
   function getPageWindow() {
@@ -1965,7 +1970,7 @@
   }
 
   // 直播/线下课堂回放页（/pro/yktmanage/s/.../lesson/...）：播放器在多层同源 iframe 里，
-  // 没有顶层 .xtplayer / 常规 heartbeat。这里只接管那个 <video>，播完后回到学习内容页重新调度。
+  // 平台会从 /m/v2/lesson/student/... iframe 原生发送 /video-log/heartbeat/。
   function handleLessonPage(config) {
     config = config || readConfig();
     var existing = findVideoElement();
@@ -1989,6 +1994,7 @@
       }
       var media = video.media;
       if (!media) return;
+      installLiveHeartbeatObserver(media);
       return setupLiveReplayPlayer(media, config.playbackRate).then(function () {
         attachVideoAutomation(media, config);
       });
@@ -2136,6 +2142,178 @@
     return false;
   }
 
+  function installLiveHeartbeatObserver(media) {
+    var docs = [];
+    if (media && media.ownerDocument) docs.push(media.ownerDocument);
+    collectFrameDocuments(document, [], 0).forEach(function (doc) {
+      if (docs.indexOf(doc) < 0) docs.push(doc);
+    });
+    docs.forEach(function (doc) {
+      var win = doc && doc.defaultView;
+      if (win) patchLiveHeartbeatWindow(win);
+    });
+  }
+
+  function patchLiveHeartbeatWindow(win) {
+    try {
+      if (!win || win.__ytLiveHeartbeatPatched) return;
+      win.__ytLiveHeartbeatPatched = true;
+
+      var originalFetch = win.fetch;
+      if (typeof originalFetch === "function") {
+        win.fetch = function () {
+          var args = Array.prototype.slice.call(arguments);
+          var url = extractRequestUrl(args[0]);
+          var body = args[1] && args[1].body;
+          var watching = isHeartbeatUrl(url);
+          var result = originalFetch.apply(this, arguments);
+          if (watching && result && typeof result.then === "function") {
+            result.then(function () {
+              recordLiveHeartbeat(url, body, "fetch");
+            }).catch(function () {
+              recordLiveHeartbeat(url, body, "fetch-error");
+            });
+          }
+          return result;
+        };
+      }
+
+      var proto = win.XMLHttpRequest && win.XMLHttpRequest.prototype;
+      if (proto && !proto.__ytLiveHeartbeatPatched) {
+        proto.__ytLiveHeartbeatPatched = true;
+        var originalOpen = proto.open;
+        var originalSend = proto.send;
+        proto.open = function (method, url) {
+          this.__ytHeartbeatUrl = extractRequestUrl(url);
+          return originalOpen.apply(this, arguments);
+        };
+        proto.send = function (body) {
+          var xhr = this;
+          var url = xhr.__ytHeartbeatUrl || "";
+          if (isHeartbeatUrl(url)) {
+            try {
+              xhr.addEventListener("loadend", function () {
+                recordLiveHeartbeat(url, body, "xhr");
+              });
+            } catch (error) { /* ignore */ }
+          }
+          return originalSend.apply(this, arguments);
+        };
+      }
+    } catch (error) {
+      log("安装直播 heartbeat 监听失败：" + error.message);
+    }
+  }
+
+  function extractRequestUrl(input) {
+    if (!input) return "";
+    if (typeof input === "string") return input;
+    if (input.url) return input.url;
+    try { return String(input); } catch (error) { return ""; }
+  }
+
+  function isHeartbeatUrl(url) {
+    return /\/video-log\/heartbeat\/?/.test(String(url || ""));
+  }
+
+  function recordLiveHeartbeat(url, body, source) {
+    var events = parseHeartbeatEvents(body);
+    var now = Date.now();
+    state.liveHeartbeatAt = now;
+    state.liveHeartbeatEvents = events;
+    if (matchesCurrentLiveHeartbeat(events)) {
+      state.liveHeartbeatLessonAt = now;
+      if (events.some(function (item) { return /videoend|ended/i.test(String(item.et || "")); })) {
+        state.liveHeartbeatVideoEndAt = now;
+      }
+      log("收到直播回放原生 heartbeat：" + describeHeartbeatEvents(events) + "（" + source + "）");
+    }
+  }
+
+  function parseHeartbeatEvents(body) {
+    if (!body) return [];
+    if (typeof body !== "string") {
+      try {
+        if (body instanceof URLSearchParams) body = body.toString();
+        else body = String(body);
+      } catch (error) {
+        return [];
+      }
+    }
+    try {
+      var data = JSON.parse(body);
+      return Array.isArray(data.heart_data) ? data.heart_data : [];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function currentLessonId() {
+    var fromTop = location.pathname.match(/\/lesson\/([^/]+)/);
+    if (fromTop) return decodeURIComponent(fromTop[1]);
+    var current = readCurrentChapter();
+    return current.lessonId || "";
+  }
+
+  function matchesCurrentLiveHeartbeat(events) {
+    if (!events.length) return false;
+    var lessonId = currentLessonId();
+    if (!lessonId) return true;
+    return events.some(function (item) {
+      return item && String(item.lesson_id || "") === String(lessonId);
+    });
+  }
+
+  function describeHeartbeatEvents(events) {
+    var names = events.map(function (item) {
+      return item && item.et ? String(item.et) : "";
+    }).filter(Boolean);
+    if (!names.length) return "unknown";
+    return names.slice(-4).join(",");
+  }
+
+  function waitForLiveHeartbeatSync(media) {
+    installLiveHeartbeatObserver(media);
+    var startedAt = Date.now() - 2000;
+    return new Promise(function (resolve) {
+      var settled = false;
+      var interval = 0;
+      var fallbackTimer = 0;
+
+      function finish(reason) {
+        if (settled) return;
+        settled = true;
+        if (interval) window.clearInterval(interval);
+        if (fallbackTimer) {
+          window.clearTimeout(fallbackTimer);
+          state.timers = state.timers.filter(function (item) { return item !== fallbackTimer; });
+        }
+        log("直播回放 heartbeat 同步等待结束：" + reason);
+        delay(POST_HEARTBACK_SETTLE_MS).then(resolve);
+      }
+
+      function check() {
+        if (isPaused()) {
+          finish("自动流程已暂停");
+          return;
+        }
+        if (state.liveHeartbeatVideoEndAt >= startedAt) {
+          finish("收到 videoend heartbeat");
+          return;
+        }
+        if (state.liveHeartbeatLessonAt >= startedAt) {
+          finish("收到当前 lesson heartbeat");
+        }
+      }
+
+      interval = window.setInterval(check, 500);
+      fallbackTimer = schedule(function () {
+        finish("等待超时兜底");
+      }, LIVE_HEARTBEAT_SYNC_WAIT_MS);
+      check();
+    });
+  }
+
   // 根据当前路由选择完成后的跳转方式：直播回放走 lesson 专用流程，普通视频走原流程。
   function goNextAfter(video) {
     if (routeName() === "lesson") goNextAfterLesson(video);
@@ -2143,8 +2321,12 @@
   }
 
   function goNextAfterLesson(video) {
-    setStatus(STATUS.scanning, "直播回放结束，返回学习内容页重新调度");
-    delay(POST_VIDEO_RESCAN_WAIT_MS).then(function () {
+    setStatus(STATUS.scanning, "直播回放结束，等待平台 heartbeat 同步");
+    waitForLiveHeartbeatSync(video).then(function () {
+      if (isPaused()) return;
+      setStatus(STATUS.scanning, "直播回放已同步，返回学习内容页重新调度");
+      return delay(POST_VIDEO_RESCAN_WAIT_MS);
+    }).then(function () {
       if (isPaused()) return;
       var studyUrl = GM_getValue("yt_auto.studyUrl", "") || "";
       if (studyUrl) {
