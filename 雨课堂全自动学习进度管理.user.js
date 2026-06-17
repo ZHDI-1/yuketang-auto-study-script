@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.6.3
+// @version      0.6.4
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
@@ -1848,8 +1848,9 @@
     }
   }
 
-  // 参考 OCS v2_watch：通过 .xtplayer 的 Vue 播放器 API 设置倍速/音量，再 player.init() 让其生效，
-  // 而不是反复改写 video.playbackRate 与播放器抢控制权。
+  // 通过 .xtplayer 的 Vue 播放器 API 设置倍速/音量状态，并直接对 <video> 设倍速。
+  // 注意：不调用 player.init()——在该播放器版本上 init() 会重建/重载 video 元素，
+  // 导致 loadstart/暂停-播放 风暴、心跳无法连续上报、进度记不上（实测）。倍速靠 video.playbackRate 已能生效。
   function setupYuketangPlayer(targetRate) {
     var effectiveRate = resolveYuketangRate(targetRate);
     var context = findYuketangPlayerContext();
@@ -1858,7 +1859,6 @@
       if (player && player.options) {
         if (player.options.speed) player.options.speed.value = effectiveRate;
         if (player.options.volume) player.options.volume.value = 0;
-        if (typeof player.init === "function") player.init();
       }
     } catch (error) {
       log("通过播放器 API 配置失败，回退到直接设置：" + error.message);
