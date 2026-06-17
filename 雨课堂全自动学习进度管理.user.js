@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.6.2
+// @version      0.7.0
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
@@ -166,6 +166,7 @@
 
   function resetQueue(reason) {
     writeQueue([], 0, "", { phase: "", myTrainingUrl: "" });
+    clearProgress();
     state.routeRunKey = "";
     state.completedRouteKey = "";
     state.running = false;
@@ -173,6 +174,35 @@
     state.lastTrainingTarget = "";
     state.trainingRevisits = 0;
     setStatus(STATUS.idle, reason || "课程队列已重置");
+  }
+
+  // 学习进度汇总（持久化，跨整页跳转仍可在面板展示）：
+  // courseTotal/courseDone 来自培训进度页；videoTotal/videoDone 来自当前课程的学习内容页。
+  var PROGRESS_KEY = "yt_auto.progress";
+
+  function readProgress() {
+    return safeJsonParse(GM_getValue(PROGRESS_KEY, ""), {}) || {};
+  }
+
+  function writeProgress(patch) {
+    if (!patch) return;
+    var next = Object.assign(readProgress(), patch);
+    GM_setValue(PROGRESS_KEY, JSON.stringify(next));
+    requestRenderPanel();
+  }
+
+  function clearProgress() {
+    GM_setValue(PROGRESS_KEY, "{}");
+    requestRenderPanel();
+  }
+
+  function getCurrentCourseTitle() {
+    var selectors = [".source-name", ".course-name", ".courseName", ".header-bar .title", ".study-content__container .title"];
+    for (var i = 0; i < selectors.length; i += 1) {
+      var el = document.querySelector(selectors[i]);
+      if (el && textOf(el)) return textOf(el).slice(0, 80);
+    }
+    return "";
   }
 
   function currentQueueItem() {
@@ -517,6 +547,7 @@
 
   function enterChapter(chapter, reason) {
     if (!chapter) return false;
+    if (chapter.title) writeProgress({ currentVideo: chapter.title });
     if (chapter.url) {
       return navigateTo(chapter.url, reason || chapter.title);
     }
@@ -553,63 +584,94 @@
     var style = document.createElement("style");
     style.id = "yt-auto-panel-style";
     style.textContent = [
-      "#yt-auto-panel{position:fixed;top:72px;right:18px;z-index:2147483647;width:320px;max-width:calc(100vw - 36px);font:13px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1f2937;background:#fff;border:1px solid #d1d5db;border-radius:8px;box-shadow:0 14px 34px rgba(0,0,0,.16);overflow:hidden}",
+      "#yt-auto-panel{position:fixed;top:64px;right:18px;z-index:2147483647;width:300px;max-width:calc(100vw - 24px);font:13px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif;color:#1f2937;background:#fff;border:1px solid #e5e7eb;border-radius:12px;box-shadow:0 12px 32px rgba(15,23,42,.18);overflow:hidden}",
       "#yt-auto-panel *{box-sizing:border-box}",
-      "#yt-auto-panel header{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#f3f4f6;border-bottom:1px solid #e5e7eb;font-weight:700;cursor:move;user-select:none}",
-      "#yt-auto-panel main{padding:10px 12px}",
+      "#yt-auto-panel header{display:flex;align-items:center;gap:8px;padding:10px 12px;background:linear-gradient(135deg,#2563eb,#4f46e5);color:#fff;cursor:move;user-select:none}",
+      "#yt-auto-panel header .yt-h-title{font-weight:700;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      "#yt-auto-panel .yt-badge{flex:0 0 auto;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600;background:rgba(255,255,255,.22);color:#fff}",
+      "#yt-auto-panel .yt-badge[data-variant='playing']{background:#22c55e}",
+      "#yt-auto-panel .yt-badge[data-variant='scanning']{background:#f59e0b}",
+      "#yt-auto-panel .yt-badge[data-variant='complete']{background:#10b981}",
+      "#yt-auto-panel .yt-badge[data-variant='error']{background:#ef4444}",
+      "#yt-auto-panel .yt-collapse{flex:0 0 auto;width:24px;height:24px;padding:0;border:none;border-radius:6px;background:rgba(255,255,255,.2);color:#fff;cursor:pointer;font-size:15px;line-height:1}",
+      "#yt-auto-panel main{padding:12px}",
+      "#yt-auto-panel .yt-msg{color:#374151;word-break:break-word;min-height:18px}",
+      "#yt-auto-panel .yt-sub{color:#94a3b8;font-size:11px;margin:2px 0 10px}",
+      "#yt-auto-panel .yt-card{background:#f8fafc;border:1px solid #eef2f7;border-radius:9px;padding:10px;margin-bottom:10px}",
+      "#yt-auto-panel .yt-prog+.yt-prog{margin-top:10px}",
+      "#yt-auto-panel .yt-prog-head{display:flex;justify-content:space-between;align-items:baseline;font-size:12px;margin-bottom:5px}",
+      "#yt-auto-panel .yt-prog-head b{font-weight:600;color:#374151}",
+      "#yt-auto-panel .yt-prog-head span{color:#64748b;font-variant-numeric:tabular-nums}",
+      "#yt-auto-panel .yt-bar{height:8px;border-radius:999px;background:#e5e7eb;overflow:hidden}",
+      "#yt-auto-panel .yt-bar-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,#22c55e,#16a34a);width:0;transition:width .3s ease}",
+      "#yt-auto-panel .yt-bar-fill.course{background:linear-gradient(90deg,#3b82f6,#6366f1)}",
+      "#yt-auto-panel .yt-cur{margin-top:9px;font-size:12px;color:#475569;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      "#yt-auto-panel .yt-cur b{color:#1f2937}",
       "#yt-auto-panel .yt-row{display:flex;gap:8px;align-items:center;margin:8px 0}",
-      "#yt-auto-panel .yt-status{display:flex;gap:8px;align-items:flex-start;margin-bottom:4px}",
-      "#yt-auto-panel .yt-flow{margin:0 0 8px;color:#6b7280;font-size:12px}",
-      "#yt-auto-panel .yt-badge{flex:0 0 auto;min-width:54px;text-align:center;border-radius:999px;padding:2px 8px;background:#e5e7eb;color:#111827;font-size:12px;font-weight:600}",
-      "#yt-auto-panel .yt-badge[data-variant='playing']{background:#dbeafe;color:#1d4ed8}",
-      "#yt-auto-panel .yt-badge[data-variant='scanning']{background:#fef3c7;color:#92400e}",
-      "#yt-auto-panel .yt-badge[data-variant='complete']{background:#dcfce7;color:#166534}",
-      "#yt-auto-panel .yt-badge[data-variant='paused']{background:#f1f5f9;color:#475569}",
-      "#yt-auto-panel .yt-badge[data-variant='error']{background:#fee2e2;color:#b91c1c}",
-      "#yt-auto-panel .yt-badge[data-variant='idle']{background:#e5e7eb;color:#374151}",
-      "#yt-auto-panel .yt-msg{min-width:0;word-break:break-word;color:#374151}",
-      "#yt-auto-panel button{height:30px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#111827;padding:0 10px;cursor:pointer;white-space:nowrap}",
-      "#yt-auto-panel button:hover{background:#f8fafc}",
+      "#yt-auto-panel button{flex:1;height:32px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;color:#111827;padding:0 8px;cursor:pointer;white-space:nowrap;font-size:13px}",
+      "#yt-auto-panel button:hover{background:#f1f5f9}",
       "#yt-auto-panel button.yt-primary{background:#2563eb;border-color:#2563eb;color:#fff}",
-      "#yt-auto-panel button.yt-danger{background:#dc2626;border-color:#dc2626;color:#fff}",
-      "#yt-auto-panel input{height:30px;min-width:0;border:1px solid #cbd5e1;border-radius:6px;padding:0 8px;background:#fff;color:#111827}",
-      "#yt-auto-panel label{display:flex;align-items:center;gap:6px;color:#374151}",
-      "#yt-auto-panel .yt-list{max-height:180px;overflow:auto;border-top:1px solid #e5e7eb;margin-top:8px;padding-top:8px}",
-      "#yt-auto-panel .yt-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid #f3f4f6}",
-      "#yt-auto-panel .yt-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
-      "#yt-auto-panel .yt-meta{font-size:12px;color:#6b7280}",
-      "#yt-auto-panel .yt-log{max-height:100px;overflow:auto;margin-top:8px;padding-top:8px;border-top:1px solid #e5e7eb;color:#4b5563;font-size:12px}",
+      "#yt-auto-panel button.yt-primary:hover{background:#1d4ed8}",
+      "#yt-auto-panel button.yt-danger{background:#fff;border-color:#fca5a5;color:#dc2626}",
+      "#yt-auto-panel button.yt-danger:hover{background:#fef2f2}",
+      "#yt-auto-panel label{display:flex;align-items:center;gap:6px;color:#374151;font-size:12px}",
+      "#yt-auto-panel input[type=number],#yt-auto-panel input[type=text]{height:30px;min-width:0;border:1px solid #cbd5e1;border-radius:7px;padding:0 8px;background:#fff;color:#111827;font-size:13px}",
+      "#yt-auto-panel .yt-list{max-height:150px;overflow:auto;border-top:1px solid #eef2f7;margin-top:6px;padding-top:6px}",
+      "#yt-auto-panel .yt-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px solid #f3f4f6}",
+      "#yt-auto-panel .yt-item:last-child{border-bottom:none}",
+      "#yt-auto-panel .yt-item .yt-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}",
+      "#yt-auto-panel .yt-item .yt-meta{font-size:11px;color:#94a3b8}",
+      "#yt-auto-panel .yt-item button{flex:0 0 auto;height:26px;font-size:12px}",
+      "#yt-auto-panel .yt-empty{color:#94a3b8;font-size:12px;text-align:center;padding:8px 0}",
+      "#yt-auto-panel .yt-logtoggle{cursor:pointer;color:#64748b;font-size:12px;user-select:none;padding:7px 0 3px;border-top:1px solid #eef2f7;margin-top:6px}",
+      "#yt-auto-panel .yt-log{max-height:96px;overflow:auto;color:#94a3b8;font-size:11px;font-family:ui-monospace,Menlo,Consolas,monospace}",
       "#yt-auto-panel .yt-log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      "#yt-auto-panel.yt-loghide .yt-log{display:none}",
       "#yt-auto-panel.yt-collapsed main{display:none}",
-      "#yt-auto-panel.yt-collapsed{width:auto}",
-      "#yt-auto-panel .yt-collapse{height:24px;padding:0 8px}"
+      "#yt-auto-panel.yt-collapsed{width:auto}"
     ].join("");
 
     var panel = document.createElement("section");
     panel.id = "yt-auto-panel";
+    panel.className = "yt-loghide";
     panel.innerHTML = [
       "<header>",
-      "  <span>雨课堂自动学习</span>",
+      "  <span class='yt-h-title'>雨课堂自动学习</span>",
+      "  <span class='yt-badge' data-role='status'></span>",
       "  <button class='yt-collapse' type='button' title='折叠/展开'>−</button>",
       "</header>",
       "<main>",
-      "  <div class='yt-status'><span class='yt-badge' data-role='status'></span><span class='yt-msg' data-role='message'></span></div>",
-      "  <div class='yt-flow' data-role='flow'></div>",
+      "  <div class='yt-msg' data-role='message'></div>",
+      "  <div class='yt-sub' data-role='sub'></div>",
+      "  <div class='yt-card'>",
+      "    <div class='yt-prog'>",
+      "      <div class='yt-prog-head'><b>课程进度</b><span data-role='course-count'>—</span></div>",
+      "      <div class='yt-bar'><div class='yt-bar-fill course' data-role='course-bar'></div></div>",
+      "    </div>",
+      "    <div class='yt-prog'>",
+      "      <div class='yt-prog-head'><b>本课视频</b><span data-role='video-count'>—</span></div>",
+      "      <div class='yt-bar'><div class='yt-bar-fill' data-role='video-bar'></div></div>",
+      "    </div>",
+      "    <div class='yt-cur' data-role='current'></div>",
+      "  </div>",
       "  <div class='yt-row'>",
-      "    <button class='yt-primary' type='button' data-action='start'>一键启动</button>",
-      "    <button type='button' data-action='scan'>扫描课程并进入</button>",
+      "    <button class='yt-primary' type='button' data-action='start'>▶ 一键启动</button>",
+      "    <button class='yt-danger' type='button' data-action='pause'>⏸ 暂停</button>",
+      "  </div>",
+      "  <div class='yt-row'>",
+      "    <button type='button' data-action='scan'>扫描并进入</button>",
       "    <button type='button' data-action='resetQueue'>重置队列</button>",
-      "    <button class='yt-danger' type='button' data-action='pause'>暂停自动</button>",
       "  </div>",
       "  <div class='yt-row'>",
       "    <label><input type='checkbox' data-field='autoStart'>自动模式</label>",
-      "    <label>倍速 <input type='number' data-field='playbackRate' min='0.25' max='16' step='0.25' style='width:74px'></label>",
+      "    <label style='margin-left:auto'>倍速<input type='number' data-field='playbackRate' min='0.25' max='16' step='0.25' style='width:64px'></label>",
       "  </div>",
       "  <div class='yt-row'>",
       "    <input type='text' data-field='targetCourseName' placeholder='指定课程名，留空选第一个' style='flex:1'>",
-      "    <button type='button' data-action='save'>保存</button>",
+      "    <button type='button' data-action='save' style='flex:0 0 auto'>保存</button>",
       "  </div>",
       "  <div class='yt-list' data-role='items'></div>",
+      "  <div class='yt-logtoggle' data-action='toggleLog'>运行日志 ▾</div>",
       "  <div class='yt-log' data-role='logs'></div>",
       "</main>"
     ].join("");
@@ -657,6 +719,10 @@
       } else if (action === "save") {
         savePanelConfig();
         setStatus(STATUS.idle, "配置已保存");
+      } else if (action === "toggleLog") {
+        var hidden = panel.classList.toggle("yt-loghide");
+        var toggle = panel.querySelector("[data-action='toggleLog']");
+        if (toggle) toggle.textContent = hidden ? "运行日志 ▾" : "运行日志 ▴";
       }
     });
 
@@ -725,30 +791,59 @@
     var panel = document.getElementById("yt-auto-panel");
     if (!panel) return;
     var config = readConfig();
-    var status = panel.querySelector("[data-role='status']");
-    var message = panel.querySelector("[data-role='message']");
-    var flow = panel.querySelector("[data-role='flow']");
-    var logs = panel.querySelector("[data-role='logs']");
-    var items = panel.querySelector("[data-role='items']");
-    var autoStart = panel.querySelector("[data-field='autoStart']");
-    var playbackRate = panel.querySelector("[data-field='playbackRate']");
-    var targetCourseName = panel.querySelector("[data-field='targetCourseName']");
+    var prog = readProgress();
 
+    var status = panel.querySelector("[data-role='status']");
     if (status) {
       status.textContent = state.status;
       status.setAttribute("data-variant", statusVariant(state.status));
     }
-    if (message) message.textContent = state.message || "";
-    if (flow) flow.textContent = describeFlow();
+    setPanelText(panel, "message", state.message || "");
+    setPanelText(panel, "sub", describeFlow());
+
+    renderProgressBar(panel, "course", prog.courseDone, prog.courseTotal);
+    renderProgressBar(panel, "video", prog.videoDone, prog.videoTotal);
+    var current = panel.querySelector("[data-role='current']");
+    if (current) {
+      var parts = [];
+      if (prog.currentCourse) parts.push("<b>" + escapeHtml(prog.currentCourse) + "</b>");
+      if (prog.currentVideo) parts.push(escapeHtml(prog.currentVideo));
+      current.innerHTML = parts.length ? ("正在学习：" + parts.join(" · ")) : "";
+    }
+
+    var autoStart = panel.querySelector("[data-field='autoStart']");
+    var playbackRate = panel.querySelector("[data-field='playbackRate']");
+    var targetCourseName = panel.querySelector("[data-field='targetCourseName']");
     if (autoStart) autoStart.checked = config.autoStart;
     if (playbackRate && document.activeElement !== playbackRate) playbackRate.value = String(config.playbackRate);
     if (targetCourseName && document.activeElement !== targetCourseName) targetCourseName.value = config.targetCourseName;
+
+    var logs = panel.querySelector("[data-role='logs']");
     if (logs) {
       logs.innerHTML = state.logs.map(function (line) {
         return "<div title='" + escapeHtml(line) + "'>" + escapeHtml(line) + "</div>";
       }).join("");
     }
+    var items = panel.querySelector("[data-role='items']");
     if (items) renderItems(items);
+  }
+
+  function setPanelText(panel, role, text) {
+    var el = panel.querySelector("[data-role='" + role + "']");
+    if (el) el.textContent = text;
+  }
+
+  function renderProgressBar(panel, key, done, total) {
+    done = Math.max(0, Number(done) || 0);
+    total = Math.max(0, Number(total) || 0);
+    var countEl = panel.querySelector("[data-role='" + key + "-count']");
+    var barEl = panel.querySelector("[data-role='" + key + "-bar']");
+    if (countEl) {
+      countEl.textContent = total > 0 ? (done + " / " + total + "（剩 " + Math.max(0, total - done) + "）") : "—";
+    }
+    if (barEl) {
+      barEl.style.width = (total > 0 ? Math.min(100, Math.round(done / total * 100)) : 0) + "%";
+    }
   }
 
   function statusVariant(status) {
@@ -765,60 +860,50 @@
     var phaseLabel = queue.phase === "selecting"
       ? "选课中"
       : (queue.phase === "learning" ? "学习中" : "未开始");
-    var text = "阶段：" + phaseLabel;
-    if (queue.items.length) {
-      text += " · 队列 " + Math.min(queue.index + 1, queue.items.length) + "/" + queue.items.length;
-    }
-    var config = readConfig();
-    text += " · 倍速 " + config.playbackRate + "x";
-    return text;
+    return phaseLabel + " · 倍速 " + readConfig().playbackRate + "x";
   }
 
   function renderItems(container) {
     var name = routeName();
-    var queue = readQueue();
-    var queueMeta = queue.items.length
-      ? "<div class='yt-meta'>课程队列：" + Math.min(queue.index + 1, queue.items.length) + "/" + queue.items.length + "</div>"
-      : "";
     if (name === "selectCourse") {
-      container.innerHTML = queueMeta + (state.courseItems.length ? state.courseItems.map(function (item, index) {
+      container.innerHTML = state.courseItems.length ? state.courseItems.map(function (item, index) {
         return [
           "<div class='yt-item'>",
           "  <div class='yt-title' title='" + escapeHtml(item.title) + "'>" + escapeHtml(item.title) + "</div>",
           "  <button type='button' data-course-index='" + index + "'>进入</button>",
           "</div>"
         ].join("");
-      }).join("") : "<div class='yt-meta'>尚未扫描到课程</div>");
+      }).join("") : "<div class='yt-empty'>尚未扫描到课程</div>";
       return;
     }
     if (name === "studyContent") {
-      container.innerHTML = queueMeta + (state.chapterItems.length ? state.chapterItems.slice(0, 12).map(function (item, index) {
+      container.innerHTML = state.chapterItems.length ? state.chapterItems.slice(0, 20).map(function (item, index) {
         return [
           "<div class='yt-item'>",
           "  <div style='min-width:0'>",
-          "    <div class='yt-title' title='" + escapeHtml(item.title) + "'>" + escapeHtml(item.title) + "</div>",
-          "    <div class='yt-meta'>" + escapeHtml(item.typeLabel + " / " + item.statusLabel) + "</div>",
+          "    <div class='yt-title' title='" + escapeHtml(item.title) + "'>" + (item.complete ? "✓ " : "") + escapeHtml(item.title) + "</div>",
+          "    <div class='yt-meta'>" + escapeHtml(item.statusLabel) + "</div>",
           "  </div>",
           (item.action || item.url) ? "  <button type='button' data-chapter-index='" + index + "'>进入</button>" : "",
           "</div>"
         ].join("");
-      }).join("") : "<div class='yt-meta'>尚未扫描到章节</div>");
+      }).join("") : "<div class='yt-empty'>尚未扫描到视频章节</div>";
       return;
     }
     if (name === "myTraining") {
-      container.innerHTML = queueMeta + (state.courseItems.length ? state.courseItems.slice(0, 12).map(function (item) {
+      container.innerHTML = state.courseItems.length ? state.courseItems.slice(0, 20).map(function (item) {
         return [
           "<div class='yt-item'>",
           "  <div style='min-width:0'>",
-          "    <div class='yt-title' title='" + escapeHtml(item.title) + "'>" + escapeHtml(item.title) + "</div>",
+          "    <div class='yt-title' title='" + escapeHtml(item.title) + "'>" + (item.complete ? "✓ " : "") + escapeHtml(item.title) + "</div>",
           "    <div class='yt-meta'>进度 " + escapeHtml(item.progressText || "") + "</div>",
           "  </div>",
           "</div>"
         ].join("");
-      }).join("") : "<div class='yt-meta'>尚未扫描到已选课程</div>");
+      }).join("") : "<div class='yt-empty'>尚未扫描到已选课程</div>";
       return;
     }
-    container.innerHTML = queueMeta + "<div class='yt-meta'>当前页：" + escapeHtml(location.pathname) + "</div>";
+    container.innerHTML = "";
   }
 
   function escapeHtml(value) {
@@ -1249,7 +1334,14 @@
     }).then(function (rows) {
       if (isPaused()) return;
       if (!rows) return;
-      state.courseItems = rows;
+      var summary = scanMyTrainingSummary();
+      state.courseItems = summary.length ? summary : rows;
+      if (summary.length) {
+        writeProgress({
+          courseTotal: summary.length,
+          courseDone: summary.filter(function (c) { return c.complete; }).length
+        });
+      }
       requestRenderPanel();
       var next = rows.find(function (row) {
         return !row.complete && row.action;
@@ -1272,8 +1364,29 @@
         refreshCurrentPage("课程“" + next.title + "”进度未同步为已完成");
         return;
       }
+      // 进入新课程时清空“本课视频”进度，等学习内容页扫描后再填充。
+      writeProgress({ currentCourse: next.title, currentVideo: "", videoTotal: 0, videoDone: 0 });
       clickElement(next.action, "进入未完成课程 " + next.title + "（" + next.progressText + "）");
     });
+  }
+
+  // 扫描培训进度页所有课程行（不要求有“去学习”按钮），用于统计课程总数/完成数。
+  function scanMyTrainingSummary() {
+    return Array.from(document.querySelectorAll("tr"))
+      .filter(isVisible)
+      .map(function (row) {
+        var cells = Array.from(row.querySelectorAll("td"));
+        if (cells.length < 2) return null;
+        var title = cells[1] ? textOf(cells[1]) : "";
+        var progressText = cells[5] ? textOf(cells[5]) : "";
+        if (!progressText) {
+          var m = textOf(row).match(/(\d+(?:\.\d+)?)\s*%|已完成/);
+          progressText = m ? m[0] : "";
+        }
+        if (!title || !progressText) return null;
+        return { title: title, progressText: progressText, complete: isProgressDone(progressText) };
+      })
+      .filter(Boolean);
   }
 
   function scanMyTrainingRows() {
@@ -1383,6 +1496,11 @@
       if (isPaused()) return;
       if (!chapters) return;
       state.chapterItems = chapters;
+      writeProgress({
+        videoTotal: chapters.length,
+        videoDone: chapters.filter(function (c) { return c.complete; }).length,
+        currentCourse: getCurrentCourseTitle() || readProgress().currentCourse || ""
+      });
       requestRenderPanel();
       var next = findNextPlayableChapter(chapters);
       if (next) {
