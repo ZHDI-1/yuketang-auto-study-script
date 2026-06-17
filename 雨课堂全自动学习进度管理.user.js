@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.7.1
+// @version      0.8.0
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
@@ -68,7 +68,8 @@
     myTraining: /\/pro\/trainingproject\/mytraining\/detail\/\d+/,
     courseAbout: /\/pro\/portal\/about\/project_/,
     studyContent: /\/pro\/lms\/[^/]+\/[^/]+\/studycontent(?:[/?#]|$)/,
-    video: /\/pro\/lms\/[^/]+\/[^/]+\/video\//
+    video: /\/pro\/lms\/[^/]+\/[^/]+\/video\//,
+    lesson: /\/pro\/yktmanage\/s\/[^/]+\/lesson\//
   };
   var STATUS = {
     idle: "空闲",
@@ -569,7 +570,13 @@
     if (ROUTE.courseAbout.test(path)) return "courseAbout";
     if (ROUTE.studyContent.test(path)) return "studyContent";
     if (ROUTE.video.test(path)) return "video";
+    if (ROUTE.lesson.test(path)) return "lesson";
     return "unknown";
+  }
+
+  // 接管播放器、且页面会停留（不应被 completedRouteKey 拦截重入）的路由。
+  function isPlayerRoute(name) {
+    return name === "video" || name === "lesson";
   }
 
   function looksLoggedOut() {
@@ -1015,7 +1022,7 @@
     var name = routeName();
     var key = currentRouteKey();
     if (state.running && state.routeRunKey === key) return;
-    if (state.completedRouteKey === key && name !== "video") return;
+    if (state.completedRouteKey === key && !isPlayerRoute(name)) return;
     if (state.routeRunKey !== key) {
       clearManagedAsync();
       state.routeRunKey = key;
@@ -1036,6 +1043,8 @@
       task = handleStudyContentPage(config);
     } else if (name === "video") {
       task = handleVideoPage(config);
+    } else if (name === "lesson") {
+      task = handleLessonPage(config);
     } else {
       setStatus(STATUS.idle, "等待进入课程相关页面");
       state.running = false;
@@ -1045,7 +1054,7 @@
 
     Promise.resolve(task).then(function () {
       if (state.routeRunKey !== key) return;
-      if (name !== "video") state.completedRouteKey = key;
+      if (!isPlayerRoute(name)) state.completedRouteKey = key;
     }).catch(function (error) {
       if (state.routeRunKey === key) {
         state.completedRouteKey = "";
@@ -1534,6 +1543,8 @@
 
   function handleStudyContentPage(config) {
     setStatus(STATUS.scanning, "等待章节列表");
+    // 记录学习内容页地址，供直播回放页播完后返回（lesson 页无法推算 studycontent 地址）。
+    GM_setValue("yt_auto.studyUrl", location.href);
     return retryWait(function () {
       var chapters = scanChapters();
       return chapters.length ? chapters : null;
@@ -1560,21 +1571,15 @@
     var vueChapters = scanChaptersFromVue();
     if (vueChapters.length) return vueChapters;
 
+    // 收窄到章节叶子本身，避免像 [class*='lesson'] 把整页容器（.lesson_student__container）选进来。
     var selectors = [
-      ".chapter-list",
+      ".study-content__container .chapter-list .leaf-detail",
       ".chapter-list .leaf-detail",
-      ".chapter-list .content",
       ".leaf-detail",
       ".leaf-title",
       "a[href*='/video/']",
       "[data-type*='video' i]",
-      "[class*='video' i]",
-      "[class*='chapter' i]",
-      "[class*='lesson' i]",
-      "[class*='catalog' i] li",
-      "[class*='tree' i] li",
-      "[role='treeitem']",
-      "[role='listitem']"
+      "[role='treeitem']"
     ];
     var nodes = Array.from(document.querySelectorAll(selectors.join(","))).filter(isVisible);
     var items = nodes.map(function (node) {
@@ -1620,19 +1625,27 @@
       leaves.forEach(function (leaf) {
         if (!leaf || leaf.is_show === false || leaf.is_locked) return;
         var type = Number(leaf.leaf_type);
-        if (type !== 0) return;
+        var isVideo = type === 0;   // 普通视频
+        var isLive = type === 8;    // 直播/线下课堂的回放
+        if (!isVideo && !isLive) return;
         var progress = Number(schedules[leaf.id] || 0);
         var complete = progress >= 1;
-        var title = leaf.name || chapter.name || ("视频 " + leaf.id);
-        var url = location.origin + "/pro/lms/" + encodeURIComponent(sign) + "/" + encodeURIComponent(classroomId) + "/video/" + encodeURIComponent(leaf.id);
+        var title = leaf.name || chapter.name || ((isLive ? "直播回放 " : "视频 ") + leaf.id);
+        // 普通视频用 /video/{id} 直接导航；直播回放没有该地址，必须点击章节里的 .leaf-detail
+        // 让平台自己跳到 /pro/yktmanage/s/.../lesson/...。
+        var url = isVideo
+          ? (location.origin + "/pro/lms/" + encodeURIComponent(sign) + "/" + encodeURIComponent(classroomId) + "/video/" + encodeURIComponent(leaf.id))
+          : "";
+        var leafEl = findLeafDetailByTitle(title);
         items.push({
           key: String(leaf.id),
           title: title,
           url: url,
-          action: null,
-          element: findChapterElementByTitle(title) || container,
+          action: isVideo ? null : leafEl,
+          element: leafEl || container,
           type: "video",
-          typeLabel: "视频",
+          live: isLive,
+          typeLabel: isLive ? "直播回放" : "视频",
           complete: complete,
           progress: progress,
           statusLabel: complete ? "已完成" : Math.floor(progress * 100) + "%",
@@ -1642,6 +1655,15 @@
     });
 
     return uniqueByElement(items);
+  }
+
+  // 直播回放需要点击章节里的 .leaf-detail 才能跳转，这里按标题精确定位该元素。
+  function findLeafDetailByTitle(title) {
+    if (!title) return null;
+    var leaves = Array.from(document.querySelectorAll(".chapter-list .leaf-detail, .leaf-detail")).filter(isVisible);
+    return leaves.find(function (node) {
+      return textOf(node).indexOf(title) >= 0;
+    }) || null;
   }
 
   function findChapterElementByTitle(title) {
@@ -1673,7 +1695,11 @@
   }
 
   function findChapterAction(row) {
-    var yuketangLeaf = Array.from(row.querySelectorAll(".leaf-detail, .content, .leaf-title"))
+    // 优先点击 .leaf-detail 本身——普通视频和直播回放点它都能正确跳转；.content 往往点不动。
+    if (row.matches && row.matches(".leaf-detail") && isVisible(row)) return row;
+    var leafDetail = Array.from(row.querySelectorAll(".leaf-detail")).filter(isVisible)[0];
+    if (leafDetail) return leafDetail;
+    var yuketangLeaf = Array.from(row.querySelectorAll(".content, .leaf-title"))
       .filter(isVisible)[0];
     if (yuketangLeaf) return yuketangLeaf;
     var preferred = Array.from(row.querySelectorAll("a,button,[role='button']")).filter(isVisible).find(function (node) {
@@ -1757,8 +1783,70 @@
     });
   }
 
+  // 直播/线下课堂回放页（/pro/yktmanage/s/.../lesson/...）：播放器在多层同源 iframe 里，
+  // 没有顶层 .xtplayer / 常规 heartbeat。这里只接管那个 <video>，播完后回到学习内容页重新调度。
+  function handleLessonPage(config) {
+    config = config || readConfig();
+    var existing = findVideoElement();
+    if (existing && existing.__ytAutoAttached) return Promise.resolve();
+    state.handledEnd = false;
+    state.videoRetryCount = 0;
+    state.reacquiring = false;
+    setStatus(STATUS.playing, "等待直播回放播放器");
+    return retryWait(function () {
+      return findVideoElement();
+    }, "直播回放播放器", config.maxRetries, 25000).then(function (video) {
+      if (!video || isPaused()) return;
+      try { video.playbackRate = resolveYuketangRate(config.playbackRate); } catch (error) { /* ignore */ }
+      attachVideoAutomation(video, config);
+    });
+  }
+
+  // 根据当前路由选择完成后的跳转方式：直播回放走 lesson 专用流程，普通视频走原流程。
+  function goNextAfter(video) {
+    if (routeName() === "lesson") goNextAfterLesson(video);
+    else goNextAfterVideo(video);
+  }
+
+  function goNextAfterLesson(video) {
+    setStatus(STATUS.scanning, "直播回放结束，返回学习内容页重新调度");
+    delay(POST_VIDEO_RESCAN_WAIT_MS).then(function () {
+      if (isPaused()) return;
+      var studyUrl = GM_getValue("yt_auto.studyUrl", "") || "";
+      if (studyUrl) {
+        navigateTo(studyUrl, "返回学习内容页");
+        return;
+      }
+      // 没有记录到学习内容页地址时，回退用浏览器后退。
+      try { history.back(); } catch (error) { refreshCurrentPage("无法返回学习内容页"); }
+    });
+  }
+
+  // 判断 video 是否仍挂在它自己的文档树上（兼容 iframe 内的 video——顶层 document.contains 对它无效）。
+  function isVideoConnected(video) {
+    if (!video) return false;
+    if (typeof video.isConnected === "boolean") return video.isConnected;
+    var doc = video.ownerDocument;
+    return Boolean(doc && doc.contains(video));
+  }
+
+  // 收集本文档及所有同源 iframe（直播回放播放器嵌套在多层 iframe 中）里的 <video>。
+  function collectVideos(doc, acc, depth) {
+    if (!doc || depth > 5) return acc;
+    try {
+      Array.prototype.push.apply(acc, Array.from(doc.querySelectorAll("video")));
+      var frames = doc.querySelectorAll("iframe,frame");
+      for (var i = 0; i < frames.length; i += 1) {
+        var childDoc = null;
+        try { childDoc = frames[i].contentDocument; } catch (error) { childDoc = null; } // 跨域 -> null
+        if (childDoc) collectVideos(childDoc, acc, depth + 1);
+      }
+    } catch (error) { /* ignore */ }
+    return acc;
+  }
+
   function findVideoElement() {
-    var videos = Array.from(document.querySelectorAll("video")).filter(function (video) {
+    var videos = collectVideos(document, [], 0).filter(function (video) {
       return isVisible(video) || video.readyState > 0 || video.duration;
     });
     if (videos.length) {
@@ -1782,7 +1870,7 @@
       if (state.handledEnd || isPaused()) return;
       state.handledEnd = true;
       log("检测到 ended 事件");
-      goNextAfterVideo(video);
+      goNextAfter(video);
     };
     var onPause = function () {
       // 参考 OCS：未结束就稍后续播，逻辑保持简单，不再维护冷却/重试计数等复杂状态。
@@ -1864,7 +1952,7 @@
     }
     // 播放器重建/切换清晰度会把旧 <video> 移出文档，旧的事件监听全部失效。
     // 这种情况必须重新获取当前 video 并重新接管，否则整个自动流程会卡死。
-    if (/removed from the document|not in the document/i.test(message) || !document.contains(video)) {
+    if (/removed from the document|not in the document/i.test(message) || !isVideoConnected(video)) {
       reacquireVideo("播放被打断（媒体已被移除）");
       return;
     }
@@ -1881,7 +1969,7 @@
     var tryAttach = function (attemptsLeft) {
       if (isPaused() || state.handledEnd) { state.reacquiring = false; return; }
       var video = findVideoElement();
-      if (video && document.contains(video) && !video.__ytAutoAttached) {
+      if (video && isVideoConnected(video) && !video.__ytAutoAttached) {
         state.reacquiring = false;
         attachVideoAutomation(video, readConfig());
         return;
@@ -1931,7 +2019,7 @@
 
     var timer = window.setInterval(function () {
       if (state.handledEnd || isPaused()) return;
-      if (!document.contains(video)) {
+      if (!isVideoConnected(video)) {
         // 播放器重建了 video 元素：停止这个 watchdog，并重新接管当前页面的 video。
         window.clearInterval(timer);
         reacquireVideo("watchdog 检测到视频已被移除");
@@ -1969,7 +2057,7 @@
         if (nudgeCount >= 3 && !state.handledEnd) {
           state.handledEnd = true;
           log("多次推动仍未触发 ended，进入完成同步流程");
-          goNextAfterVideo(video);
+          goNextAfter(video);
         }
         return;
       }
