@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂全自动学习进度管理
 // @namespace    https://kmustyjscfd.yuketang.cn/
-// @version      0.8.1
+// @version      0.8.2
 // @description  自动遍历雨课堂课程章节视频，按配置倍速播放，并在播放结束后跳转下一节；遇到加载/卡顿故障自动刷新本页重试并保持自动模式。
 // @author       local
 // @license      GPL-3.0-only
@@ -169,6 +169,7 @@
   function resetQueue(reason) {
     writeQueue([], 0, "", { phase: "", myTrainingUrl: "" });
     clearProgress();
+    clearSkipState();
     state.routeRunKey = "";
     state.completedRouteKey = "";
     state.running = false;
@@ -181,6 +182,9 @@
   // 学习进度汇总（持久化，跨整页跳转仍可在面板展示）：
   // courseTotal/courseDone 来自培训进度页；videoTotal/videoDone 来自当前课程的学习内容页。
   var PROGRESS_KEY = "yt_auto.progress";
+  var SKIPPED_COURSES_KEY = "yt_auto.skippedCourses";
+  var SKIPPED_CHAPTERS_KEY = "yt_auto.skippedChapters";
+  var CURRENT_CHAPTER_KEY = "yt_auto.currentChapter";
 
   function readProgress() {
     return safeJsonParse(GM_getValue(PROGRESS_KEY, ""), {}) || {};
@@ -196,6 +200,87 @@
   function clearProgress() {
     GM_setValue(PROGRESS_KEY, "{}");
     requestRenderPanel();
+  }
+
+  function readStore(key) {
+    return safeJsonParse(GM_getValue(key, "{}"), {}) || {};
+  }
+
+  function writeStore(key, value) {
+    GM_setValue(key, JSON.stringify(value || {}));
+  }
+
+  function clearSkipState() {
+    writeStore(SKIPPED_COURSES_KEY, {});
+    writeStore(SKIPPED_CHAPTERS_KEY, {});
+    GM_setValue(CURRENT_CHAPTER_KEY, "");
+  }
+
+  function trainingIdFromUrl(url) {
+    var match = String(url || "").match(/\/pro\/trainingproject\/mytraining\/detail\/(\d+)/);
+    return match ? match[1] : "";
+  }
+
+  function activeTrainingId() {
+    var direct = getTrainClassId();
+    if (direct) return direct;
+    var queue = readQueue();
+    if (queue.myTrainingUrl) return trainingIdFromUrl(queue.myTrainingUrl);
+    var current = readCurrentChapter();
+    return current.trainingId || "";
+  }
+
+  function courseSkipKey(title, trainingId) {
+    return String(trainingId || activeTrainingId() || "global") + "|" + String(title || "");
+  }
+
+  function markCourseSkipped(title, reason, trainingId) {
+    title = String(title || "").trim();
+    if (!title) return;
+    var store = readStore(SKIPPED_COURSES_KEY);
+    store[courseSkipKey(title, trainingId)] = {
+      title: title,
+      reason: reason || "本轮跳过",
+      at: Date.now()
+    };
+    writeStore(SKIPPED_COURSES_KEY, store);
+    log("本轮跳过课程：" + title + "（" + (reason || "无可播放内容") + "）");
+  }
+
+  function isCourseSkipped(title, trainingId) {
+    title = String(title || "").trim();
+    if (!title) return false;
+    return Boolean(readStore(SKIPPED_COURSES_KEY)[courseSkipKey(title, trainingId)]);
+  }
+
+  function chapterSkipRecord(key) {
+    key = String(key || "");
+    return key ? readStore(SKIPPED_CHAPTERS_KEY)[key] || null : null;
+  }
+
+  function markChapterSkipped(chapter, reason) {
+    var key = chapter && chapter.key ? String(chapter.key) : "";
+    if (!key) return;
+    var store = readStore(SKIPPED_CHAPTERS_KEY);
+    store[key] = {
+      title: chapter.title || "",
+      reason: reason || "本轮跳过",
+      at: Date.now()
+    };
+    writeStore(SKIPPED_CHAPTERS_KEY, store);
+    log("本轮跳过章节：" + (chapter.title || key) + "（" + (reason || "无可播放内容") + "）");
+  }
+
+  function isChapterSkipped(item) {
+    return Boolean(item && item.key && chapterSkipRecord(item.key));
+  }
+
+  function readCurrentChapter() {
+    return safeJsonParse(GM_getValue(CURRENT_CHAPTER_KEY, ""), {}) || {};
+  }
+
+  function writeCurrentChapter(chapter) {
+    GM_setValue(CURRENT_CHAPTER_KEY, JSON.stringify(chapter || {}));
   }
 
   function getCurrentCourseTitle() {
@@ -223,7 +308,7 @@
   }
 
   function currentCourseSign() {
-    var match = location.pathname.match(/\/(?:about|lms)\/(project_[^/?#]+)/);
+    var match = location.pathname.match(/\/pro\/portal\/about\/([^/?#]+)/) || location.pathname.match(/\/pro\/lms\/([^/]+)\//);
     if (match) return decodeURIComponent(match[1]);
     return "";
   }
@@ -312,6 +397,39 @@
       }
     }
     return advanceQueue(reason || "当前课程完成");
+  }
+
+  function skipCurrentCourse(reason) {
+    var progress = readProgress();
+    var current = readCurrentChapter();
+    var queueItem = currentQueueItem();
+    var title = progress.currentCourse || current.courseTitle || getCurrentCourseTitle() || (queueItem && queueItem.title) || "";
+    markCourseSkipped(title, reason || "当前课程无可播放内容", current.trainingId);
+    var queue = readQueue();
+    var url = queue.myTrainingUrl || current.myTrainingUrl || buildMyTrainingUrl();
+    if (url) {
+      setStatus(STATUS.scanning, (reason || "当前课程无可播放内容") + "，返回培训进度页继续下一门");
+      schedule(function () {
+        if (!isPaused()) navigateTo(url, "跳过当前课程后返回培训进度页");
+      }, ROUTE_STABLE_WAIT_MS);
+      return true;
+    }
+    block(reason || "当前课程无可播放内容，需要手动返回培训进度页");
+    return false;
+  }
+
+  function skipCurrentChapter(reason) {
+    var current = readCurrentChapter();
+    if (current && current.key) markChapterSkipped(current, reason || "当前章节无可播放内容");
+    var studyUrl = (current && current.studyUrl) || GM_getValue("yt_auto.studyUrl", "");
+    if (studyUrl) {
+      setStatus(STATUS.scanning, (reason || "当前章节无可播放内容") + "，返回学习内容页继续扫描");
+      schedule(function () {
+        if (!isPaused()) navigateTo(studyUrl, "跳过当前章节后返回学习内容页");
+      }, ROUTE_STABLE_WAIT_MS);
+      return true;
+    }
+    return skipCurrentCourse(reason || "当前章节无可播放内容");
   }
 
   function normalizeRate(value) {
@@ -557,6 +675,14 @@
   function enterChapter(chapter, reason) {
     if (!chapter) return false;
     if (chapter.title) writeProgress({ currentVideo: chapter.title });
+    writeCurrentChapter({
+      key: chapter.key || "",
+      title: chapter.title || "",
+      studyUrl: routeName() === "studyContent" ? location.href : (GM_getValue("yt_auto.studyUrl", "") || ""),
+      courseTitle: readProgress().currentCourse || getCurrentCourseTitle() || "",
+      trainingId: activeTrainingId(),
+      myTrainingUrl: readQueue().myTrainingUrl || buildMyTrainingUrl()
+    });
     if (chapter.url) {
       return navigateTo(chapter.url, reason || chapter.title);
     }
@@ -936,7 +1062,7 @@
           "    <div class='yt-title' title='" + escapeHtml(item.title) + "'>" + (item.complete ? "✓ " : "") + escapeHtml(item.title) + "</div>",
           "    <div class='yt-meta'>" + escapeHtml(item.statusLabel) + "</div>",
           "  </div>",
-          (item.action || item.url) ? "  <button type='button' data-chapter-index='" + index + "'>进入</button>" : "",
+          (!isChapterSkipped(item) && (item.action || item.url)) ? "  <button type='button' data-chapter-index='" + index + "'>进入</button>" : "",
           "</div>"
         ].join("");
       }).join("") : "<div class='yt-empty'>尚未扫描到视频章节</div>";
@@ -944,11 +1070,12 @@
     }
     if (name === "myTraining") {
       container.innerHTML = state.courseItems.length ? state.courseItems.slice(0, 20).map(function (item) {
+        var skipped = isCourseSkipped(item.title);
         return [
           "<div class='yt-item'>",
           "  <div style='min-width:0'>",
-          "    <div class='yt-title' title='" + escapeHtml(item.title) + "'>" + (item.complete ? "✓ " : "") + escapeHtml(item.title) + "</div>",
-          "    <div class='yt-meta'>进度 " + escapeHtml(item.progressText || "") + "</div>",
+          "    <div class='yt-title' title='" + escapeHtml(item.title) + "'>" + (item.complete ? "✓ " : (skipped ? "↷ " : "")) + escapeHtml(item.title) + "</div>",
+          "    <div class='yt-meta'>" + (skipped ? "本轮已跳过 · " : "") + "进度 " + escapeHtml(item.progressText || "") + "</div>",
           "  </div>",
           "</div>"
         ].join("");
@@ -999,6 +1126,11 @@
     if (name === "video") {
       setStatus(STATUS.playing, "正在接管视频播放");
       handleVideoPage();
+      return;
+    }
+    if (name === "lesson") {
+      setStatus(STATUS.playing, "正在接管直播回放播放");
+      handleLessonPage();
       return;
     }
     setStatus(STATUS.idle, "当前页面不在自动流程范围内");
@@ -1101,7 +1233,10 @@
       return scanCourses().length ? true : null;
     }, "课程列表", config.maxRetries);
 
-    if (forceReset) writeQueue([], 0, "");
+    if (forceReset) {
+      writeQueue([], 0, "");
+      clearSkipState();
+    }
     await goToFirstSelectCoursePage();
 
     var all = [];
@@ -1398,12 +1533,15 @@
       }
       requestRenderPanel();
       var next = rows.find(function (row) {
-        return !row.complete && row.action;
+        return !row.complete && row.action && !isCourseSkipped(row.title);
       });
       if (!next) {
         state.lastTrainingTarget = "";
         state.trainingRevisits = 0;
-        setStatus(STATUS.complete, "已选课程全部完成");
+        var skippedCount = rows.filter(function (row) {
+          return !row.complete && row.action && isCourseSkipped(row.title);
+        }).length;
+        setStatus(STATUS.complete, skippedCount ? ("已选课程全部完成或本轮跳过不可学习课程 " + skippedCount + " 门") : "已选课程全部完成");
         return;
       }
       if (state.lastTrainingTarget === next.title) {
@@ -1545,10 +1683,19 @@
     setStatus(STATUS.scanning, "等待章节列表");
     // 记录学习内容页地址，供直播回放页播完后返回（lesson 页无法推算 studycontent 地址）。
     GM_setValue("yt_auto.studyUrl", location.href);
-    return retryWait(function () {
-      var chapters = scanChapters();
-      return chapters.length ? chapters : null;
-    }, "章节列表", config.maxRetries).then(function (chapters) {
+    return delay(ROUTE_STABLE_WAIT_MS).then(function () {
+      if (isPaused()) return null;
+      return retryWait(function () {
+        var chapters = scanChapters();
+        if (chapters.length) {
+          // Vue 的 chapter_list 通常先到，直播课可点击的 .leaf-detail 会晚几秒出现。
+          // 此时继续等待，避免把“未完成但入口未渲染好”的 leaf 误判为没有可学内容。
+          return hasPendingChapterAction(chapters) ? null : chapters;
+        }
+        if (isStudyContentUnavailable()) return [];
+        return null;
+      }, "章节列表", config.maxRetries, 20000);
+    }).then(function (chapters) {
       if (isPaused()) return;
       if (!chapters) return;
       state.chapterItems = chapters;
@@ -1563,8 +1710,27 @@
         enterChapter(next, "自动进入未完成视频 " + next.title);
         return;
       }
+      if (!chapters.length && isStudyContentUnavailable()) {
+        skipCurrentCourse("当前课程未发布学习内容");
+        return;
+      }
+      if (chapters.some(isChapterSkipped)) {
+        skipCurrentCourse("当前课程剩余章节无可播放回放");
+        return;
+      }
       completeCurrentCourse("当前课程没有未完成视频章节");
     });
+  }
+
+  function hasPendingChapterAction(chapters) {
+    return chapters.some(function (item) {
+      return item.type === "video" && !item.complete && !item.locked && !isChapterSkipped(item) && item.pendingAction;
+    });
+  }
+
+  function isStudyContentUnavailable() {
+    var text = textOf(document.body);
+    return /老师没有发布学习内容|未发布学习内容|暂无学习内容|暂无内容|未发布任何学习内容/.test(text);
   }
 
   function scanChapters() {
@@ -1591,14 +1757,17 @@
       var type = detectChapterType(row, action, text);
       var complete = isChapterComplete(row, text);
       var locked = /未开放|不可学习|锁定|敬请期待/.test(text);
+      var key = fallbackChapterKey(title);
+      var skipped = Boolean(chapterSkipRecord(key));
       return {
+        key: key,
         title: title,
         action: action,
         element: row,
         type: type,
         typeLabel: type === "video" ? "视频" : "非视频",
         complete: complete,
-        statusLabel: complete ? "已完成" : (locked ? "不可学习" : "未完成"),
+        statusLabel: skipped ? "本轮已跳过" : (complete ? "已完成" : (locked ? "不可学习" : "未完成")),
         locked: locked
       };
     }).filter(function (item) {
@@ -1637,8 +1806,11 @@
           ? (location.origin + "/pro/lms/" + encodeURIComponent(sign) + "/" + encodeURIComponent(classroomId) + "/video/" + encodeURIComponent(leaf.id))
           : "";
         var leafEl = findLeafDetailByTitle(title);
+        var key = buildChapterKey(sign, classroomId, leaf.id);
+        var skipped = Boolean(chapterSkipRecord(key));
         items.push({
-          key: String(leaf.id),
+          key: key,
+          leafId: String(leaf.id),
           title: title,
           url: url,
           action: isVideo ? null : leafEl,
@@ -1648,13 +1820,22 @@
           typeLabel: isLive ? "直播回放" : "视频",
           complete: complete,
           progress: progress,
-          statusLabel: complete ? "已完成" : Math.floor(progress * 100) + "%",
+          statusLabel: skipped ? "本轮已跳过" : (complete ? "已完成" : Math.floor(progress * 100) + "%"),
+          pendingAction: isLive && !leafEl,
           locked: false
         });
       });
     });
 
     return uniqueByElement(items);
+  }
+
+  function buildChapterKey(sign, classroomId, leafId) {
+    return [sign || currentCourseSign() || "unknown", classroomId || "unknown", String(leafId || "")].join("|");
+  }
+
+  function fallbackChapterKey(title) {
+    return [location.pathname, String(title || "")].join("|");
   }
 
   // 直播回放需要点击章节里的 .leaf-detail 才能跳转，这里按标题精确定位该元素。
@@ -1754,7 +1935,7 @@
 
   function findNextPlayableChapter(chapters) {
     return chapters.find(function (item) {
-      return item.type === "video" && !item.complete && !item.locked && (item.action || item.url);
+      return item.type === "video" && !item.complete && !item.locked && !isChapterSkipped(item) && !item.pendingAction && (item.action || item.url);
     }) || null;
   }
 
@@ -1794,12 +1975,165 @@
     state.reacquiring = false;
     setStatus(STATUS.playing, "等待直播回放播放器");
     return retryWait(function () {
-      return findVideoElement();
+      var media = findVideoElement();
+      if (media) return { media: media };
+      var unavailableReason = getLessonUnavailableReason();
+      if (unavailableReason) return { unavailableReason: unavailableReason };
+      triggerLessonPlaybackEntry();
+      return null;
     }, "直播回放播放器", config.maxRetries, 25000).then(function (video) {
       if (!video || isPaused()) return;
-      try { video.playbackRate = resolveYuketangRate(config.playbackRate); } catch (error) { /* ignore */ }
-      attachVideoAutomation(video, config);
+      if (video.unavailableReason) {
+        skipCurrentChapter(video.unavailableReason);
+        return;
+      }
+      var media = video.media;
+      if (!media) return;
+      return setupLiveReplayPlayer(media, config.playbackRate).then(function () {
+        attachVideoAutomation(media, config);
+      });
     });
+  }
+
+  function setupLiveReplayPlayer(media, targetRate) {
+    var effectiveRate = 0;
+    return selectLiveReplayRate(targetRate, media).then(function (rate) {
+      effectiveRate = rate;
+      if (!media) return;
+      if (!effectiveRate) {
+        try { media.playbackRate = normalizeRate(targetRate); } catch (error) { /* ignore */ }
+        log("直播回放未找到原生倍速组件，已回退到底层媒体倍速");
+        return;
+      }
+      var actual = Number(media.playbackRate) || 0;
+      if (Math.abs(actual - effectiveRate) > 0.01) {
+        try { media.playbackRate = effectiveRate; } catch (error) { /* ignore */ }
+        log("直播回放原生倍速点击后未生效，已用底层媒体倍速兜底");
+      }
+    });
+  }
+
+  function selectLiveReplayRate(targetRate, media) {
+    var target = normalizeRate(targetRate);
+    var control = findLiveReplayRateControl(media);
+    if (!control) return Promise.resolve(0);
+    dispatchMouseSequence(control, ["mouseover", "mouseenter", "mousemove", "click"]);
+    return delay(250).then(function () {
+      var options = collectLiveReplayRateOptions(control.ownerDocument);
+      if (!options.length) return 0;
+      var selected = chooseClosestRate(options.map(function (item) { return item.rate; }), target);
+      var option = options.find(function (item) {
+        return Math.abs(item.rate - selected) <= 0.001;
+      });
+      if (!option) return 0;
+      dispatchMouseSequence(option.node, ["mouseover", "mouseenter", "mousemove", "mousedown", "mouseup", "click"]);
+      log("通过直播回放原生倍速组件设置为 " + selected + "x");
+      return delay(350).then(function () {
+        return selected;
+      });
+    });
+  }
+
+  function findLiveReplayRateControl(media) {
+    var docs = [];
+    if (media && media.ownerDocument) docs.push(media.ownerDocument);
+    collectFrameDocuments(document, [], 0).forEach(function (doc) {
+      if (docs.indexOf(doc) < 0) docs.push(doc);
+    });
+    for (var i = 0; i < docs.length; i += 1) {
+      var controls = Array.from(docs[i].querySelectorAll(".video-rate"));
+      var visible = controls.find(isVisibleInOwnDocument);
+      if (visible) return visible;
+      if (controls[0]) return controls[0];
+    }
+    return null;
+  }
+
+  function collectLiveReplayRateOptions(doc) {
+    var docs = [];
+    if (doc) docs.push(doc);
+    collectFrameDocuments(document, [], 0).forEach(function (item) {
+      if (docs.indexOf(item) < 0) docs.push(item);
+    });
+    var options = [];
+    docs.forEach(function (item) {
+      Array.from(item.querySelectorAll(".video-rate .option-item, .rate-options-pc .option-item, .option-item")).forEach(function (node) {
+        var match = textOf(node).match(/(\d+(?:\.\d+)?)\s*X/i);
+        if (!match) return;
+        var rate = Number(match[1]);
+        if (!Number.isFinite(rate) || rate <= 0) return;
+        options.push({ rate: rate, node: node });
+      });
+    });
+    return options;
+  }
+
+  function chooseClosestRate(rates, target) {
+    rates = rates.filter(function (rate) {
+      return Number.isFinite(rate) && rate > 0;
+    }).sort(function (a, b) {
+      return a - b;
+    });
+    if (!rates.length) return target;
+    for (var i = 0; i < rates.length; i += 1) {
+      if (Math.abs(rates[i] - target) <= 0.001) return rates[i];
+    }
+    if (target <= rates[0]) return rates[0];
+    if (target >= rates[rates.length - 1]) return rates[rates.length - 1];
+    return rates.filter(function (rate) {
+      return rate <= target;
+    }).pop() || rates[rates.length - 1];
+  }
+
+  function dispatchMouseSequence(node, names) {
+    if (!node) return;
+    var view = node.ownerDocument && node.ownerDocument.defaultView ? node.ownerDocument.defaultView : window;
+    names.forEach(function (name) {
+      try {
+        node.dispatchEvent(new MouseEvent(name, {
+          bubbles: true,
+          cancelable: true,
+          view: view
+        }));
+      } catch (error) { /* ignore */ }
+    });
+  }
+
+  function getLessonUnavailableReason() {
+    var docs = collectFrameDocuments(document, [], 0);
+    var text = docs.map(function (doc) {
+      return doc.body ? textOf(doc.body) : "";
+    }).join(" ");
+    if (/本节课无课堂回放|暂无课堂回放|没有课堂回放|暂无回放|回放暂未生成|回放生成中/.test(text)) {
+      return "当前直播章节无课堂回放";
+    }
+    return "";
+  }
+
+  function triggerLessonPlaybackEntry() {
+    var docs = collectFrameDocuments(document, [], 0);
+    var selectors = [".video-play", ".play-btn", ".fix-play-txt", ".player-from-btn", ".playback-overlay"];
+    for (var d = 0; d < docs.length; d += 1) {
+      for (var s = 0; s < selectors.length; s += 1) {
+        var nodes = Array.from(docs[d].querySelectorAll(selectors[s]));
+        for (var i = 0; i < nodes.length; i += 1) {
+          var node = nodes[i];
+          if (node.__ytLessonPlaybackClicked || !isVisibleInOwnDocument(node)) continue;
+          var marker = [textOf(node), String(node.className || ""), selectors[s]].join(" ");
+          if (!/立即播放|从这一页播放|播放|video-play|play-btn|fix-play-txt|playback-overlay/.test(marker)) continue;
+          node.__ytLessonPlaybackClicked = true;
+          try { node.scrollIntoView({ block: "center", inline: "center" }); } catch (error) { /* ignore */ }
+          try {
+            node.click();
+            log("触发直播回放播放入口：" + (textOf(node) || selectors[s]));
+            return true;
+          } catch (error) {
+            log("触发直播回放播放入口失败：" + error.message);
+          }
+        }
+      }
+    }
+    return false;
   }
 
   // 根据当前路由选择完成后的跳转方式：直播回放走 lesson 专用流程，普通视频走原流程。
@@ -1830,38 +2164,102 @@
     return Boolean(doc && doc.contains(video));
   }
 
-  // 收集本文档及所有同源 iframe（直播回放播放器嵌套在多层 iframe 中）里的 <video>。
-  function collectVideos(doc, acc, depth) {
-    if (!doc || depth > 5) return acc;
+  function isVisibleInOwnDocument(element) {
+    if (!element || !element.ownerDocument || !element.ownerDocument.defaultView) return false;
     try {
-      Array.prototype.push.apply(acc, Array.from(doc.querySelectorAll("video")));
+      var style = element.ownerDocument.defaultView.getComputedStyle(element);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+      var rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function collectFrameDocuments(doc, acc, depth) {
+    if (!doc || depth > 5) return acc;
+    acc.push(doc);
+    try {
       var frames = doc.querySelectorAll("iframe,frame");
       for (var i = 0; i < frames.length; i += 1) {
         var childDoc = null;
-        try { childDoc = frames[i].contentDocument; } catch (error) { childDoc = null; } // 跨域 -> null
-        if (childDoc) collectVideos(childDoc, acc, depth + 1);
+        try { childDoc = frames[i].contentDocument; } catch (error) { childDoc = null; }
+        if (childDoc) collectFrameDocuments(childDoc, acc, depth + 1);
       }
     } catch (error) { /* ignore */ }
     return acc;
   }
 
-  function pickLargestVideo(list) {
-    var videos = list.filter(function (video) {
-      return isVisible(video) || video.readyState > 0 || video.duration;
+  // 收集本文档及所有同源 iframe（直播回放播放器嵌套在多层 iframe 中）里的媒体元素。
+  function collectMediaElements(doc, acc, depth) {
+    if (!doc || depth > 5) return acc;
+    try {
+      Array.prototype.push.apply(acc, Array.from(doc.querySelectorAll("video,audio")).filter(isPlayableMediaElement));
+      var frames = doc.querySelectorAll("iframe,frame");
+      for (var i = 0; i < frames.length; i += 1) {
+        var childDoc = null;
+        try { childDoc = frames[i].contentDocument; } catch (error) { childDoc = null; } // 跨域 -> null
+        if (childDoc) collectMediaElements(childDoc, acc, depth + 1);
+      }
+    } catch (error) { /* ignore */ }
+    return acc;
+  }
+
+  function isPlayableMediaElement(media) {
+    if (!media) return false;
+    var tag = String(media.tagName || "").toLowerCase();
+    if (tag === "video") return true;
+    if (tag !== "audio") return false;
+    var src = "";
+    try { src = media.currentSrc || media.src || ""; } catch (error) { src = ""; }
+    var duration = Number(media.duration) || 0;
+    var ownerUrl = "";
+    try { ownerUrl = media.ownerDocument && media.ownerDocument.location ? media.ownerDocument.location.href : ""; } catch (error) { ownerUrl = ""; }
+    // 直播回放里音频课件是 <audio data-is-player data-liveid ...>；AI 助手等背景音频没有这些标记且没有有效 src。
+    return media.hasAttribute("data-is-player") || media.hasAttribute("data-liveid") || Boolean(src) || duration > 0 || (media.readyState || 0) > 0 || /\/m\/v2\/lesson\/student\//.test(ownerUrl);
+  }
+
+  function mediaScore(media) {
+    var tag = String(media.tagName || "").toLowerCase();
+    var rect = media.getBoundingClientRect ? media.getBoundingClientRect() : { width: 0, height: 0 };
+    var visible = isVisibleInOwnDocument(media);
+    var duration = Number(media.duration) || 0;
+    var src = "";
+    try { src = media.currentSrc || media.src || ""; } catch (error) { src = ""; }
+    var score = rect.width * rect.height;
+    if (tag === "video") score += 100000000;
+    if (tag === "audio") score += 50000000;
+    if (visible) score += 1000000;
+    if (duration > 0) score += 100000;
+    if (src) score += 10000;
+    if (media.hasAttribute && media.hasAttribute("data-is-player")) score += 1000;
+    return score;
+  }
+
+  function pickBestMedia(list) {
+    var mediaList = list.filter(function (media) {
+      return isPlayableMediaElement(media) && (isVisibleInOwnDocument(media) || media.readyState > 0 || Number(media.duration) > 0 || media.currentSrc || media.src);
     });
-    if (!videos.length) return null;
-    videos.sort(function (a, b) {
-      return (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight);
+    if (!mediaList.length) return null;
+    mediaList.sort(function (a, b) {
+      return mediaScore(b) - mediaScore(a);
     });
-    return videos[0];
+    return mediaList[0];
   }
 
   function findVideoElement() {
     // 普通视频页 <video> 就在顶层文档：优先用它，行为与改动前完全一致。
-    var top = pickLargestVideo(Array.from(document.querySelectorAll("video")));
+    var top = pickBestMedia(Array.from(document.querySelectorAll("video")));
     if (top) return top;
-    // 顶层没有时（直播回放页）再深入同源 iframe 查找。
-    return pickLargestVideo(collectVideos(document, [], 0));
+    var nestedVideos = collectMediaElements(document, [], 0).filter(function (media) {
+      return String(media.tagName || "").toLowerCase() === "video";
+    });
+    var nestedVideo = pickBestMedia(nestedVideos);
+    if (nestedVideo) return nestedVideo;
+    // 顶层没有视频时（直播回放音频课）再使用同源 iframe 里的有效 <audio>。
+    return pickBestMedia(collectMediaElements(document, [], 0).filter(function (media) {
+      return String(media.tagName || "").toLowerCase() === "audio";
+    }));
   }
 
   function attachVideoAutomation(video, config) {
@@ -1901,7 +2299,7 @@
           if (isPaused() || state.handledEnd) return;
           try {
             video.load();
-            applyYuketangSpeedLight(readConfig().playbackRate);
+            applyConfiguredPlaybackRate(video, readConfig().playbackRate);
             playYuketangMedia(video);
           } catch (error) {
             console.warn(error);
@@ -2078,7 +2476,7 @@
       try {
         if (recoverAttempts >= 2) {
           video.load();
-          applyYuketangSpeedLight(readConfig().playbackRate);
+          applyConfiguredPlaybackRate(video, readConfig().playbackRate);
         }
         playYuketangMedia(video);
       } catch (error) {
@@ -2103,6 +2501,14 @@
     } catch (error) {
       log("设置播放器默认参数失败：" + error.message);
     }
+  }
+
+  function applyConfiguredPlaybackRate(media, targetRate) {
+    if (routeName() === "lesson") {
+      setupLiveReplayPlayer(media || findVideoElement(), targetRate);
+      return;
+    }
+    applyYuketangSpeedLight(targetRate);
   }
 
   // 参考 OCS v2_watch：通过 .xtplayer 的 Vue 播放器 API 设置倍速/音量，再 player.init() 让其生效，
